@@ -1,0 +1,26 @@
+# Build trees. Two of them, both out of source: `build/` is the host tree that runs the
+# unit tests, `build-arm/` is the cross-compiled firmware image.
+build/
+build-arm/
+
+# CMake's compile_commands.json is generated per build tree, and clang-tidy reads the
+# copy inside build/. Nothing generated belongs in the repository.
+compile_commands.json
+
+# The walked-commit-date configuration used while reconstructing this repository's
+# history. Its state lives inside .git/ rather than here, so this is only the range
+# settings; they are ignored so the tool's configuration is not part of the tree.
+.gtime.toml
+
+# Editors and tooling
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
