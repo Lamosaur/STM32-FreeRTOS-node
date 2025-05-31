@@ -10,7 +10,12 @@ set(NODE_APP_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/hal/include
   ${CMAKE_CURRENT_SOURCE_DIR}/rtos/include)
 
+add_library(sensor_core STATIC
+  app/src/i2c_recovery.cpp)
 
+target_include_directories(sensor_core PUBLIC ${NODE_APP_INCLUDE_DIRS})
+target_link_libraries(sensor_core PRIVATE node_options_strict)
+target_compile_features(sensor_core PUBLIC cxx_std_17)
 
 # ---------------------------------------------------------------------------
 # Target build: FreeRTOS port, STM32F103 HAL implementations, and the image.
