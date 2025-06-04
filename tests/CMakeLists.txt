@@ -30,12 +30,23 @@ target_include_directories(node_test_support INTERFACE
 target_link_libraries(node_test_support INTERFACE
   sensor_core GTest::gtest Threads::Threads)
 
+add_executable(node_tests
+  test_i2c_recovery.cpp)
 
+target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main)
 
 # Test code gets -Wall -Wextra but not the full -Wconversion set the core library uses:
 # GoogleTest's macros and headers would drown the signal in third-party noise.
+target_compile_options(node_tests PRIVATE -Wall -Wextra)
 
+if(NODE_SANITIZERS)
+  target_compile_options(node_tests PRIVATE
+    -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(node_tests PRIVATE -fsanitize=address,undefined)
+endif()
 
+include(GoogleTest)
+gtest_discover_tests(node_tests)
 
 # The host-side tooling is part of the deliverable, so its tests run under the same
 # ctest invocation as the C++ suite rather than in a separate command someone has to
