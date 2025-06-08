@@ -11,7 +11,8 @@ set(NODE_APP_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/rtos/include)
 
 add_library(sensor_core STATIC
-  app/src/i2c_recovery.cpp)
+  app/src/i2c_recovery.cpp
+  app/src/i2c_arbiter.cpp)
 
 target_include_directories(sensor_core PUBLIC ${NODE_APP_INCLUDE_DIRS})
 target_link_libraries(sensor_core PRIVATE node_options_strict)
