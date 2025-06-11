@@ -31,7 +31,8 @@ target_link_libraries(node_test_support INTERFACE
   sensor_core GTest::gtest Threads::Threads)
 
 add_executable(node_tests
-  test_i2c_recovery.cpp)
+  test_i2c_recovery.cpp
+  test_i2c_arbiter.cpp)
 
 target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main)
 
