@@ -13,7 +13,8 @@ set(NODE_APP_INCLUDE_DIRS
 add_library(sensor_core STATIC
   app/src/i2c_recovery.cpp
   app/src/i2c_arbiter.cpp
-  app/src/supervisor.cpp)
+  app/src/supervisor.cpp
+  app/src/sensor.cpp)
 
 target_include_directories(sensor_core PUBLIC ${NODE_APP_INCLUDE_DIRS})
 target_link_libraries(sensor_core PRIVATE node_options_strict)
