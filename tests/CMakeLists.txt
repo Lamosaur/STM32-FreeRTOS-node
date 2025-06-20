@@ -33,7 +33,8 @@ target_link_libraries(node_test_support INTERFACE
 add_executable(node_tests
   test_i2c_recovery.cpp
   test_i2c_arbiter.cpp
-  test_supervisor.cpp)
+  test_supervisor.cpp
+  test_sensor.cpp)
 
 target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main)
 
