@@ -16,7 +16,8 @@ add_library(sensor_core STATIC
   app/src/supervisor.cpp
   app/src/sensor.cpp
   app/src/comms.cpp
-  app/src/display.cpp)
+  app/src/display.cpp
+  app/src/node.cpp)
 
 target_include_directories(sensor_core PUBLIC ${NODE_APP_INCLUDE_DIRS})
 target_link_libraries(sensor_core PRIVATE node_options_strict)
