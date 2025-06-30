@@ -36,7 +36,8 @@ add_executable(node_tests
   test_supervisor.cpp
   test_sensor.cpp
   test_comms.cpp
-  test_display.cpp)
+  test_display.cpp
+  test_node.cpp)
 
 target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main)
 
