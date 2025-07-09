@@ -59,3 +59,11 @@ gtest_discover_tests(node_tests)
 # remember. The parser decides what a measurement is recorded as, which makes a silent
 # parse failure a wrong figure in docs/measurements.md.
 find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME host_tools
+           COMMAND ${Python3_EXECUTABLE} -m unittest -v test_host_tools)
+  set_tests_properties(host_tools PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+else()
+  message(STATUS "python3 not found: the host tooling tests will not run")
+endif()
