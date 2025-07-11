@@ -1,0 +1,146 @@
+name: CI
+
+# FR-0.6 requires the target-independent logic to build and run on the host, and Phase 1
+# (FR-1.6) requires host unit tests plus a static analysis step on every push. Both are
+# wired up here from Phase 0 so that the guarantee exists as soon as there is code to
+# guarantee anything about.
+#
+# Three jobs, because they fail for genuinely different reasons:
+#   host-tests       the application logic is wrong, or the C/C++ boundary has broken
+#   firmware-build   the target build, the FreeRTOS port or the HAL does not compile
+#   static-analysis  the code is suspect without being wrong yet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Keep the "is it broken or is it flaky" question out of CI: warnings are failures.
+  NODE_SANITIZERS: "ON"
+
+jobs:
+  host-tests:
+    name: Host unit tests (FR-0.6)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        # The application core is compiled with -Werror, so this step is also the
+        # compile-time style gate.
+        run: cmake --build build
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-test-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  firmware-build:
+    name: Firmware cross-build (arm-none-eabi)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc-arm-none-eabi binutils-arm-none-eabi
+
+      - name: Configure
+        run: |
+          cmake -B build-arm -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake \
+            -DSTM32_TOOLCHAIN_DIR=/usr/bin
+
+      - name: Build
+        run: cmake --build build-arm
+
+      - name: Check the image actually has a reset vector
+        # The classic -nostartfiles failure: the image links, and there is no usable
+        # entry point. Catching it here rather than on a bench is the whole point.
+        run: |
+          arm-none-eabi-nm build-arm/firmware.elf | grep -i ' Reset_Handler$'
+          arm-none-eabi-objdump -h build-arm/firmware.elf | grep -q '\.isr_vector'
+
+      - name: Report image size against the F103C8T6 budget
+        # 64 KB flash, 20 KB RAM. A regression here is a real defect, not a warning.
+        run: |
+          arm-none-eabi-size build-arm/firmware.elf
+          python3 - <<'PY'
+          import re, subprocess, sys
+
+          out = subprocess.check_output(
+              ["arm-none-eabi-size", "build-arm/firmware.elf"], text=True)
+          text, data, bss = (int(x) for x in out.strip().splitlines()[-1].split()[:3])
+
+          flash, ram = text + data, data + bss
+          print(f"flash={flash} / 65536 ({flash / 65536:.1%})")
+          print(f"static RAM={ram} / 20480 ({ram / 20480:.1%})")
+
+          # The linker script's own _estack guard is authoritative for RAM, since the
+          # FreeRTOS heap is a .bss array and the main stack is not counted by size(1).
+          failures = []
+          if flash > 65536:
+              failures.append(f"flash over budget by {flash - 65536} bytes")
+          if ram > 20480:
+              failures.append(f"static RAM over budget by {ram - 20480} bytes")
+          for failure in failures:
+              print(f"::error::{failure}")
+          sys.exit(1 if failures else 0)
+          PY
+
+      - name: Upload firmware artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build-arm/firmware.elf
+            build-arm/firmware.hex
+            build-arm/firmware.bin
+            build-arm/firmware.map
+
+  static-analysis:
+    name: Static analysis (FR-1.6)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck
+
+      - name: cppcheck the application core and the HAL interfaces
+        # --error-exitcode makes findings fail the job, so this is a gate rather than a
+        # report nobody reads. Vendored sources are excluded: they are not ours to fix.
+        run: |
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --error-exitcode=1 \
+            --std=c++17 \
+            --language=c++ \
+            --suppress=missingIncludeSystem \
+            --quiet \
+            -I firmware/app/include \
+            -I firmware/hal/include \
+            -I firmware/rtos/include \
+            firmware/app/src
