@@ -44,7 +44,8 @@ Phase 0 requirements that are statements about logic rather than about volts.
 | 0-H13 | Heartbeat deadline | **3 task periods** | `test_supervisor`, including the exact-millisecond boundary | FR-0.4 |
 | 0-H14 | Deadline arithmetic across the 32-bit ms wrap | **correct** | `test_supervisor.HeartbeatSurvivesTheMillisecondClockWrapping` | NFR-0.7 |
 | 0-H15 | Display bytes, full 128x64 frame | **1064** | `flush_full`, 8 pages x (4 command + 1 control + 128 data) | FR-0.5 |
-| 0-H16 | Display bytes, small partial update | see the FR-0.5 row below | `bytes_for`, asserted equal to what `flush` actually sends | FR-0.5 |
+| 0-H16 | Display bytes, 8x8 partial update | **13** | `bytes_for`, asserted equal to what `flush` actually sends | FR-0.5 |
+| 0-H16b | Display bytes, 128x32 status band | **532** | same; 4 pages x (5 command + 128 data) | FR-0.5 |
 | 0-H17 | Display bus path | **DMA only** | `test_node.DisplayNeverUsesTheBlockingBusPath`: the polled path is never used by the display task | FR-0.5 |
 | 0-H18 | Bus bytes for an unchanged screen | **0** | `test_node`: the render is skipped when no displayed value changed | FR-0.5 |
 | 0-H19 | Stale-reading detection | **2 consecutive failures** | `test_node`: the panel leaves the number and reports staleness instead of freezing | FR-0.5 |
@@ -58,9 +59,21 @@ the bus.
 | Update | Pages touched | Bytes on the bus | Fraction of a full frame |
 |--------|---------------|------------------|--------------------------|
 | Full frame, 128x64 | 8 | 1064 | 100 % |
-| Status screen, 128x32 | 4 | see row 0-H16 | about 50 % |
-| 8x8 corner region | 1 | see row 0-H16 | about 1 % |
+| Status screen, 128x32 (what the node draws) | 4 | 532 | 50 % |
+| 8x8 region | 1 | 13 | 1.2 % |
 | Unchanged screen | 0 | 0 | 0 % |
+
+Counting rule: a page transaction is five bytes of command and control (one control byte,
+the page-address command, two column-address commands, and the data control byte) plus one
+byte per column of the damaged range, which is where the 8 + 5 = 13 comes from.
+
+Both figures come from the shipping code path rather than from arithmetic: `bytes_for()` is
+the prediction and the bus double's byte counter is what actually went out, and the test
+asserts the two agree.
+
+At 400 kHz, 532 bytes is about 12 ms of bus time against a full frame's ~23 ms, and an
+8-byte update is about 0.3 ms. The status screen is the number that matters, because it is
+what the node actually redraws.
 
 ---
 
