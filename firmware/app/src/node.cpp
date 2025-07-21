@@ -2,29 +2,6 @@
 
 namespace node {
 
-namespace {
-
-// Task table, in descending priority so the order here matches the reasoning in
-// node.h. Names are short because FreeRTOS keeps only a pointer, but they are what a
-// debugger shows, so they are worth having.
-struct TaskSpec {
-  TaskId id;
-  const char *name;
-};
-
-constexpr TaskSpec kTaskTable[] = {
-    {TaskId::Supervisor, "supervisor"},
-    {TaskId::Sensor, "sensor"},
-    {TaskId::App, "app"},
-    {TaskId::Comms, "comms"},
-    {TaskId::Display, "display"},
-};
-
-static_assert(sizeof(kTaskTable) / sizeof(kTaskTable[0]) == kTaskCount,
-              "the task table must describe exactly the five tasks of FR-0.1");
-
-} // namespace
-
 const char *to_string(PlantState state) {
   switch (state) {
     case PlantState::Unknown: return "unknown";
@@ -87,10 +64,12 @@ bool Node::init() {
   // Every task except the supervisor is watched. The supervisor is the one doing the
   // watching, and it is covered by the watchdog itself: if it stops feeding, the node
   // resets.
-  supervisor_.watch(TaskId::Sensor, kSensorPeriodMs);
-  supervisor_.watch(TaskId::Display, kDisplayPeriodMs);
-  supervisor_.watch(TaskId::App, kAppPeriodMs);
-  supervisor_.watch(TaskId::Comms, kCommsPeriodMs);
+  // Periods come from the task table rather than from loose constants, so a task's
+  // heartbeat deadline cannot drift out of step with the loop that actually runs it.
+  supervisor_.watch(TaskId::Sensor, task_period_ms(TaskId::Sensor));
+  supervisor_.watch(TaskId::Display, task_period_ms(TaskId::Display));
+  supervisor_.watch(TaskId::App, task_period_ms(TaskId::App));
+  supervisor_.watch(TaskId::Comms, task_period_ms(TaskId::Comms));
 
   comms_.send_banner();
   return true;
@@ -101,14 +80,16 @@ bool Node::start() {
     return false;
   }
 
-  for (const TaskSpec &spec : kTaskTable) {
+  // One table, from board.h: a task's priority, stack and period are reviewed together,
+  // and its FreeRTOS name is part of the same specification.
+  for (const TaskSpec &spec : kTaskSpecs) {
     const size_t index = static_cast<size_t>(spec.id);
     contexts_[index].node = this;
     contexts_[index].id = spec.id;
 
     rtos_task_t *task = hw_.rtos->task_create(
         hw_.rtos->ctx, spec.name, &Node::task_entry, &contexts_[index],
-        task_stack_words(spec.id), task_priority(spec.id));
+        spec.stack_words, spec.priority);
     if (task == nullptr) {
       return false;
     }
@@ -261,12 +242,14 @@ bool Node::render_status() {
     humidity.str("RH ").fixed(next.humidity_milli_rh, 2).str(" %");
     canvas_.draw_text(0, 16, humidity.c_str());
 
+    // The initialiser is the Unknown case, so that branch needs no assignment of its
+    // own; repeating the string there is a dead store.
     const char *plant = "RH --";
     switch (next.plant) {
       case PlantState::Dry: plant = "RH LO"; break;
       case PlantState::Ok:  plant = "RH OK"; break;
       case PlantState::Wet: plant = "RH HI"; break;
-      case PlantState::Unknown: plant = "RH --"; break;
+      case PlantState::Unknown: break;
     }
     canvas_.draw_text(0, 24, plant);
   } else if (next.ever_valid) {

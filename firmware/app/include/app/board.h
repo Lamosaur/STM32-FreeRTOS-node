@@ -91,56 +91,76 @@ enum class TaskId : uint8_t {
 
 constexpr uint32_t kTaskCount = static_cast<uint32_t>(TaskId::Count);
 
-constexpr uint32_t task_priority(TaskId id) {
-  switch (id) {
-    case TaskId::Supervisor: return 4;
-    case TaskId::Sensor:     return 3;
-    case TaskId::App:        return 3;
-    case TaskId::Comms:      return 2;
-    case TaskId::Display:    return 1;
-    case TaskId::Count:      break;
+// ---- The task budget ------------------------------------------------------
+//
+// One table rather than three switches, because these properties are reviewed together
+// and separately they hide their relationships. Two of them are deliberately equal, and as
+// duplicated switch branches those read exactly like a copy-paste slip — which is what a
+// linter sees too (clang-tidy's bugprone-branch-clone). Stating them once, side by side,
+// says "intended" instead of "suspicious", and makes the whole 20 KB budget readable at a
+// glance.
+//
+// Priorities (FreeRTOS: a higher number preempts a lower one):
+//   4 supervisor  highest, because feeding the watchdog late is the one failure that
+//                 resets the node
+//   3 sensor      the node's primary input; a missed sample is a missed measurement
+//   3 app         owns application state, and becomes the Phase 1 control loop. Equal to
+//                 the sensor on purpose: neither should preempt the other, and time
+//                 slicing between two critical-path tasks is the intended relationship
+//   2 comms       a host that stops reading must not stall the node
+//   1 display     cosmetic, and the long-running holder of the I2C mutex, which is
+//                 exactly the priority-inversion case FR-1.7 instruments
+// `name` is what FreeRTOS keeps a pointer to and what a debugger shows, so it is short
+// but not cryptic. It lives here rather than in a second table so that a task's whole
+// specification is one row.
+struct TaskSpec {
+  TaskId id;
+  const char *name;
+  uint32_t priority;
+  uint32_t stack_words;
+  uint32_t period_ms;
+};
+
+// Stack sizes are in words, as FreeRTOS counts them (4 bytes). Provisional: NFR-1.11
+// requires these to be right-sized from uxTaskGetStackHighWaterMark() with 25 % headroom
+// kept, and the F103C8T6 has only 20 KB of RAM, so raising one is a real budget decision
+// rather than a free change.
+//
+// Periods: Phase 0 carries no control loop (that is Phase 1), so the app task's period is
+// the one that will become the control period, which keeps the scheduling measurements
+// taken here comparable to Phase 1's.
+constexpr TaskSpec kTaskSpecs[kTaskCount] = {
+    {TaskId::Supervisor, "supervisor", 4, 192, 250},
+    {TaskId::Sensor, "sensor", 3, 320, 1000},
+    {TaskId::App, "app", 3, 320, 100},
+    {TaskId::Comms, "comms", 2, 384, 50},
+    {TaskId::Display, "display", 1, 384, 200},
+};
+
+// The table must be indexed by TaskId, because everything below looks a row up by casting
+// the id. A row inserted in the wrong place would silently give a task another task's
+// priority, so the invariant is checked rather than trusted.
+constexpr bool task_table_is_indexed_by_id() {
+  for (uint32_t row = 0; row < kTaskCount; ++row) {
+    if (static_cast<uint32_t>(kTaskSpecs[row].id) != row) {
+      return false;
+    }
   }
-  return 1;
+  return true;
+}
+static_assert(task_table_is_indexed_by_id(), "kTaskSpecs must be ordered by TaskId");
+
+// An out-of-range id resolves to the supervisor's row rather than reading past the array.
+// A wrong id is a programming error, and the alternative — returning a default — would
+// hide it at the one place it matters.
+constexpr const TaskSpec &task_spec(TaskId id) {
+  const uint32_t index = static_cast<uint32_t>(id);
+  return kTaskSpecs[index < kTaskCount ? index : 0];
 }
 
-// Stack sizes in words (FreeRTOS counts 4-byte words). Provisional: NFR-1.11 requires
-// these to be right-sized from uxTaskGetStackHighWaterMark() with 25% headroom kept,
-// and the F103C8T6 has only 20 KB of RAM, so raising one of these is a real budget
-// decision rather than a free change.
-constexpr uint32_t task_stack_words(TaskId id) {
-  switch (id) {
-    case TaskId::Supervisor: return 192;
-    case TaskId::Sensor:     return 320;
-    case TaskId::App:        return 320;
-    case TaskId::Comms:      return 384;
-    case TaskId::Display:    return 384;
-    case TaskId::Count:      break;
-  }
-  return 256;
-}
-
-// Task periods. Phase 0 carries no real control loop (that is Phase 1); the app task
-// currently runs at a period that will become the control period, so the scheduling
-// measurements taken here are comparable to Phase 1's.
-constexpr uint32_t kSensorPeriodMs = 1000;
-constexpr uint32_t kDisplayPeriodMs = 200;
-constexpr uint32_t kAppPeriodMs = 100;
-constexpr uint32_t kCommsPeriodMs = 50;
-constexpr uint32_t kSupervisorPeriodMs = 250;
-
-// Each task's period, in one place, so the heartbeat deadlines the supervisor derives
-// from these cannot drift out of step with the loops that actually run.
-constexpr uint32_t task_period_ms(TaskId id) {
-  switch (id) {
-    case TaskId::Supervisor: return kSupervisorPeriodMs;
-    case TaskId::Sensor:     return kSensorPeriodMs;
-    case TaskId::App:        return kAppPeriodMs;
-    case TaskId::Comms:      return kCommsPeriodMs;
-    case TaskId::Display:    return kDisplayPeriodMs;
-    case TaskId::Count:      break;
-  }
-  return 1000;
-}
+constexpr uint32_t task_priority(TaskId id) { return task_spec(id).priority; }
+constexpr uint32_t task_stack_words(TaskId id) { return task_spec(id).stack_words; }
+constexpr uint32_t task_period_ms(TaskId id) { return task_spec(id).period_ms; }
 
 // ---------------------------------------------------------------------------
 // Application thresholds

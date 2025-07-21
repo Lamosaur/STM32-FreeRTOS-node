@@ -86,6 +86,12 @@ static hal_i2c_status_t status_from_hal(HAL_StatusTypeDef status, uint32_t error
  * The cast is done through uintptr_t so that the const is dropped explicitly at one
  * place rather than by weakening the interface's signature. */
 static uint8_t *unconst(const uint8_t *p) {
+  // The round trip through uintptr_t is deliberate: a direct cast from const uint8_t* to
+  // uint8_t* would remove the qualifier and be caught by -Wcast-qual, and weakening
+  // hal/i2c.h's signature instead would give up that warning for the whole interface.
+  // The integer hop is a compile-time style matter here, not a cost: nothing about the
+  // generated code differs on this target.
+  // NOLINTNEXTLINE(performance-no-int-to-ptr) -- see above
   return (uint8_t *)(uintptr_t)p;
 }
 
