@@ -67,7 +67,18 @@ target_compile_options(node_options_strict INTERFACE -Werror)
 if(CMAKE_CROSSCOMPILING)
   add_compile_options(
     -mcpu=cortex-m3 -mthumb -mfloat-abi=soft
-    -ffunction-sections -fdata-sections)
+    -ffunction-sections -fdata-sections
+    # The image is freestanding, so say so rather than relying on nothing ever throwing.
+    # With exceptions left on, a `throw`, a `typeid`, or any standard-library type that
+    # throws compiles cleanly and then either drags the unwinder into a 64 KB part or
+    # fails at a call that was never linked. -fno-threadsafe-statics additionally drops
+    # the __cxa_guard_acquire/release pair that guards function-local statics, which have
+    # no meaning when the only thread is the one starting up.
+    # One expression per flag: a generator expression containing spaces is split
+    # into separate arguments by CMake's parser, which produces a mangled flag.
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>)
   add_link_options(-mcpu=cortex-m3 -mthumb -mfloat-abi=soft)
 endif()
 
