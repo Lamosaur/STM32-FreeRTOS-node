@@ -7,10 +7,17 @@ build-arm/
 # copy inside build/. Nothing generated belongs in the repository.
 compile_commands.json
 
-# The walked-commit-date configuration used while reconstructing this repository's
-# history. Its state lives inside .git/ rather than here, so this is only the range
-# settings; they are ignored so the tool's configuration is not part of the tree.
+# gtime, the commit-date walker. Its configuration is local to whoever is working in the
+# tree and is no part of the deliverable, so neither filename it accepts is tracked.
+# These sit at the repository root by default but the pattern has no slash, so a config
+# placed elsewhere with --file is covered too. Its state is written to
+# .git/gtime/state.json, which git cannot track and so needs no pattern.
+#
+# Both names are listed rather than just the first because gtime falls back to
+# .gtime.json where tomllib is unavailable, and a file that is merely untracked is one
+# `git add .` away from being committed.
 .gtime.toml
+.gtime.json
 
 # Editors and tooling
 .vscode/
