@@ -163,6 +163,56 @@ constexpr uint32_t task_stack_words(TaskId id) { return task_spec(id).stack_word
 constexpr uint32_t task_period_ms(TaskId id) { return task_spec(id).period_ms; }
 
 // ---------------------------------------------------------------------------
+// Phase 1 — analog acquisition (decision recorded in design-spec.md 6.1)
+// ---------------------------------------------------------------------------
+// fs = 1 kHz, triggered by a hardware timer, DMA into a double buffer (FR-1.1).
+//
+// The rate is chosen for oversampling, not for bandwidth. A soil-moisture probe's
+// information lives below a few Hz, so the samples exist to be averaged: averaging N
+// samples buys about log4(N) bits of effective resolution against the converter's noise
+// floor. NFR-1.12 measures how much is actually realised rather than assuming the
+// textbook figure, because that gain only materialises if the noise genuinely dithers
+// the input.
+constexpr uint32_t kAdcSampleRateHz = 1'000;
+constexpr size_t kAdcBlockSamples = 100;  // one published value per completed block
+constexpr uint32_t kAdcPublishRateHz =
+    kAdcSampleRateHz / static_cast<uint32_t>(kAdcBlockSamples);  // 10 Hz
+
+// The anti-alias filter, as components, because the corner is a hardware decision that
+// the Phase 1 breadboard and then the Phase 3 board both have to implement (FR-1.2,
+// FR-3.10).
+//
+// The corner sits one decade below Nyquist rather than at it, and the reason matters: a
+// single pole rolls off at only -20 dB/decade, so it cannot deliver 12-bit anti-aliasing
+// on its own — pushing an alias below one LSB would need a corner thousands of times
+// below Nyquist, which would also destroy the signal. What the RC is for is a defined,
+// predictable rolloff that attenuates what is actually present on this board (mains hum
+// and its harmonics, gate-driver switching) and that can be swept and compared against an
+// LTspice prediction, which is what bring-up-log step 7 asks for.
+//
+//   fc = 1 / (2*pi*R*C) = 1 / (2*pi*10k*150n) = 106.1 Hz, against a Nyquist of 500 Hz.
+constexpr uint32_t kAfeResistorOhms = 10'000;
+constexpr uint32_t kAfeCapacitorPicoFarads = 150'000;  // 150 nF
+constexpr uint32_t kAfeCornerMilliHz = 106'100;
+
+// Completed blocks awaiting averaging. Two is the minimum that survives one late consumer;
+// each extra slot costs kAdcBlockSamples * 2 bytes (200 here) and only helps if the
+// consumer stalls for longer than that. Past that point the overrun counter is the honest
+// answer rather than an ever-growing queue.
+constexpr size_t kAdcBlockRingCapacity = 2;
+
+// Two-point probe calibration: the averaged counts measured in air-dry soil and in
+// saturated soil. Linear between them, clamped outside.
+//
+// These are PLACEHOLDERS and must be replaced with measured values at bring-up. The
+// transfer function of a resistive probe depends on its geometry, its supply and the
+// soil, so inventing a formula here would be a guess dressed as physics; two measured
+// points and a line between them is the honest model. They are also runtime-tunable
+// (FR-1.4), so recalibrating does not mean reflashing.
+constexpr uint16_t kProbeCountsDry = 3'600;
+constexpr uint16_t kProbeCountsWet = 1'400;
+
+// ---------------------------------------------------------------------------
 // Application thresholds
 // ---------------------------------------------------------------------------
 // Phase 0 has no actuator, so these only classify the reading for the display and the
