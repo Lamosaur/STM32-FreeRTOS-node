@@ -1,3 +1,42 @@
+# --- Agent working files ---------------------------------------------------
+# Scratch, plan and progress-tracking documents an agent session may create while
+# working in this tree. None is a project deliverable, and none belongs in the history.
+#
+# The patterns name exact files rather than globbing by concept, and that is the whole
+# point of them being this explicit. docs/bring-up-log.md IS a log — it is also a
+# required deliverable (FR-3.16) and the primary record of the hardware work. A pattern
+# like *log*.md, *progress*, or docs/*log* would silently swallow it, and an ignored
+# tracked file is invisible until someone notices it is missing. The documents this
+# project ships are named descriptively (design-spec.md, measurements.md,
+# bring-up-log.md, README.md), so nothing here can collide with one by accident.
+#
+# Deliberately NOT ignored: AGENTS.md. That is instructions for working in this
+# repository rather than progress tracking, and it is meant to be committed and read.
+PROGRESS.md
+TODO.md
+STATUS.md
+HANDOFF.md
+SESSION.md
+SCRATCH.md
+NOTES.md
+PLAN.md
+*.progress.md
+*-progress.md
+*-handoff.md
+*-scratch.md
+*-agent.md
+agent.log
+agent-logs/
+
+# Agent scratch directories. harness/ is the path this project's own commit-history
+# reconstruction used; the rest are the conventional spellings.
+harness/
+.harness/
+.scratch/
+scratch/
+.agent/
+.agents/
+
 # Build trees. Two of them, both out of source: `build/` is the host tree that runs the
 # unit tests, `build-arm/` is the cross-compiled firmware image.
 build/
