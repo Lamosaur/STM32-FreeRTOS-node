@@ -15,6 +15,7 @@ add_library(sensor_core STATIC
   app/src/i2c_arbiter.cpp
   app/src/supervisor.cpp
   app/src/sensor.cpp
+  app/src/acquisition.cpp
   app/src/comms.cpp
   app/src/display.cpp
   app/src/node.cpp)
