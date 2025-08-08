@@ -16,6 +16,7 @@ add_library(sensor_core STATIC
   app/src/supervisor.cpp
   app/src/sensor.cpp
   app/src/acquisition.cpp
+  app/src/timing.cpp
   app/src/comms.cpp
   app/src/display.cpp
   app/src/node.cpp)
