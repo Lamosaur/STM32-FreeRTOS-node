@@ -36,6 +36,7 @@ add_executable(node_tests
   test_supervisor.cpp
   test_sensor.cpp
   test_acquisition.cpp
+  test_timing.cpp
   test_comms.cpp
   test_display.cpp
   test_node.cpp)
