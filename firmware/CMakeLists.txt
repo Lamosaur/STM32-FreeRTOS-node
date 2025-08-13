@@ -17,6 +17,7 @@ add_library(sensor_core STATIC
   app/src/sensor.cpp
   app/src/acquisition.cpp
   app/src/timing.cpp
+  app/src/step_capture.cpp
   app/src/comms.cpp
   app/src/display.cpp
   app/src/node.cpp)
