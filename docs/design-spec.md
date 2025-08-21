@@ -1,8 +1,23 @@
 # Design Specification and Requirements Plan
 
 **Project:** STM32 FreeRTOS Sensor & Control Node
-**Revision:** 0.5 (draft)
-**Status:** Phase 0 implemented and host-verified; Phases 1-3 planned; Phase 4 deferred
+**Revision:** 0.6 (draft)
+**Status:** Phase 0 implemented and host-verified; Phase 1 in progress (host-verifiable
+core); Phases 2-3 planned; Phase 4 deferred
+
+**Revision 0.6 change:** Phase 1's decisions are settled and recorded in Section 6.1, and
+three statements in Section 6 that those decisions contradict have been corrected rather
+than left standing:
+
+- The control period is **1 s**, chosen from the plant's time constant. The section's
+  earlier "not sufficient at 1 kHz" described a fast loop, and is now marked as such —
+  measuring the jitter of the 1 s loop satisfies NFR-1.8, which names no rate.
+- The output is **time-proportioned actuator switching**, not fast PWM. It still satisfies
+  FR-1.3, and Section 6.1 says why.
+- Setpoint and gains are published by **snapshot with an atomic swap, not the mutex this
+  section originally specified**. A mutex there would put a lock inside the loop whose
+  jitter NFR-1.8 measures, and would itself be the priority-inversion case FR-1.7 exists
+  to measure.
 
 **Revision 0.5 change:** Phase 0 has been implemented. Its task architecture, I2C
 arbiter and release sequence, supervisor, sensor service, display path and host test
@@ -13,8 +28,13 @@ status statements throughout this document have been corrected accordingly: no l
 **What has not happened.** No board has been brought up, no firmware has been flashed,
 and nothing has been measured with an instrument. Every figure in Section 9 is still
 open except the ones marked host-verified in
-[measurements.md](measurements.md). The Phase 0 evidence is evidence about logic
-verified on the host (FR-0.6), not about volts.
+[measurements.md](measurements.md). The evidence for Phases 0 and 1 is evidence about
+logic verified on the host (FR-0.6), not about volts.
+
+Within Phase 1, the acquisition service, the control loop, the tuning store and the
+step-response recorder exist and are host-tested, but the ADC/DMA HAL that feeds them and
+the actuator output that drains them are not written yet — so the Phase 1 code compiles
+for the target without being linked into the image, and none of it has run on silicon.
 
 **Revision 0.4 change:** the record now states plainly that no implementation exists
 yet. Phase 0 is a design to be built, not an as-built description, and the design
@@ -381,22 +401,64 @@ choice, the toolchain path, and the board outline size.
 
 ## 6. Phase 1 design — deterministic sensing and control
 
-**Signal path:** sensor → op-amp buffer → RC anti-alias filter → ADC (timer-triggered,
-DMA circular half/full-complete interrupts) → double buffer → sensor task → control
-task (PID, fixed period) → PWM → gate driver → actuator.
+**Signal path:** soil-moisture probe → op-amp buffer → RC anti-alias filter → ADC
+(timer-triggered, DMA circular half/full-complete interrupts) → double buffer →
+acquisition service → control task (PID, fixed period) → time-proportioned actuator
+switching → gate driver → pump.
 
 **Key design points:**
 
 - Half/full-transfer-complete callbacks only signal a task; no processing in interrupt
   context. This keeps ISR latency (NFR-1.9) defensible.
 - Control period is set by a hardware timer, not `vTaskDelay`, so period accuracy does
-  not depend on tick granularity. `vTaskDelayUntil` with a tick-based period is *not*
-  sufficient at 1 kHz.
-- Gains and setpoint live in a struct guarded by a mutex, written by the comms task and
-  read by the control task, so tuning does not require a reflash (FR-1.4).
+  not depend on tick granularity.
+- Setpoint and gains are published by a **snapshot with an atomic swap, not a mutex**,
+  written by the comms task and read by the control task, so tuning does not require a
+  reflash (FR-1.4). See decision 9 in Section 6.1 for why the mutex that this section
+  originally specified was the wrong choice.
 
 **Deliverables:** firmware, host step-response plotter, measured scheduling numbers,
 CI workflow, `docs/measurements.md` with captured figures.
+
+### 6.1 Decisions settled for Phase 1
+
+Recorded the same way as Section 5.3: the authority for each is a header or a test rather
+than this table, so the reasoning lives next to the code that depends on it.
+
+#### Acquisition (FR-1.1, FR-1.2)
+
+| Decision | Settled as | Where it lives |
+|----------|-----------|----------------|
+| Sample rate | 1 kHz, timer-triggered, DMA into a double buffer. Chosen for oversampling rather than bandwidth: the probe's information is below a few Hz, so the samples exist to be averaged. | `app/board.h`, `hal/include/hal/adc.h` |
+| Averaging | 100 samples per published value → 10 Hz | `app/board.h`, `app/src/acquisition.cpp` |
+| Anti-alias corner | R = 10 kΩ, C = 150 nF → 106 Hz, one decade below Nyquist | `app/board.h` |
+| Why that corner is not anti-aliasing theatre | A single pole rolls off at −20 dB/decade, so pushing an alias below one LSB would need a corner thousands of times below Nyquist, which would also destroy the signal. The RC provides a defined, sweepable rolloff for what is actually present here (mains harmonics, gate-driver switching). | `app/board.h` |
+| Probe calibration | Two measured points and a line between them, runtime-settable. A resistive probe's transfer function depends on its geometry, supply and soil, so a formula would be a guess dressed as physics. | `app/board.h`, `app/include/app/acquisition.h` |
+| No polling | Structural, not a convention: `hal_adc_iface_t` has no "conversion ready" and no "read result" entry, so polling cannot be written (FR-1.1) | `hal/include/hal/adc.h` |
+
+#### Control (FR-1.3, FR-1.4, FR-1.5)
+
+| # | Decision | Settled as | Where it lives |
+|---|----------|-----------|----------------|
+| 1 | Controlled variable | **Soil moisture**, from the analog channel. The I2C temperature/humidity sensor stays monitored only — it does not drive the actuator. | `app/src/control.cpp` |
+| 2 | Setpoint | 450 permille (45.0 %), runtime-tunable | `app/board.h` (FR-1.4) |
+| 3 | Control period | **1000 ms.** Chosen from the plant, not from the CPU: soil responds over minutes, so a 1 kHz loop would re-decide tens of thousands of times before the process moved, reacting to sensor noise rather than to information. | `app/board.h` |
+| 4 | Output form | **Time-proportioned**: within each window the pump is on for `duty × window`. Actuator-agnostic (works for a DC pump or a solenoid valve, which fast PWM would buzz and wear), physically matched to a slow process, and directly visible on a logic analyzer. FR-1.3's "PWM actuator output" is satisfied by this: it is pulse-width modulation at the window rate. | `app/src/control.cpp` |
+| 5 | Minimum on-time | **50 ms**; a shorter computed on-time becomes 0. Below it the pump cannot act, so ticking it would consume life without delivering water. | `app/board.h` |
+| 6 | Maximum duty | **500 permille** per window — a bound while tuning, and the integral clamp reference | `app/board.h` |
+| 7 | Loop type | **PID with `kd` defaulted to 0**, integral clamped. D acts on the rate of change of a slow, noisy reading, which is mostly noise: the measured consequence is quantified in the test that evidences this decision. | `app/src/control.cpp`, `tests/test_control.cpp` |
+| 8 | Fail-safe | An absent or stale reading forces the output to **0**, integral held rather than unwound. New in Phase 1: "not acting" now has physical meaning, and a lost probe must stop the pump rather than hold its last duty. The watchdog covers a hung CPU, **not** a MOSFET stuck on, so the gate needs a hardware pull-down. | `hal/include/hal/actuator.h`, `app/src/control.cpp` |
+| 9 | Gains publication | **Snapshot + atomic swap, never a mutex.** A mutex here would put a lock acquisition inside the very loop whose jitter NFR-1.8 measures, and would itself be the priority-inversion case FR-1.7 exists to measure. | `app/include/app/control.h` |
+| 10 | 1 kHz | **Not** the control period. If that figure is wanted it is a separate, explicitly labelled scheduling test — presenting it as a control requirement would be the measurement plan flattering itself. | — |
+
+**Verification consequence.** NFR-1.8 asks for control-loop period jitter without naming a
+rate, so it is satisfied honestly by measuring the jitter of the 1 s loop this plant
+needs. The 1 kHz expectation that an earlier revision of this section implied came from
+the phrase "not sufficient at 1 kHz" in the key design points above, which describes a
+*fast* loop (motor current, heater) rather than this one.
+
+**Still open:** none for Phase 1. The 1 kHz scheduling figure is available on request but
+is not planned.
 
 ## 7. Phase 2 design — bootloader and field update
 
