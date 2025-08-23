@@ -30,34 +30,22 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "app/board.h"
 #include "app/comms.h"
 
 namespace node {
 
-// Records in one capture.
+// kStepCaptureCapacity, kStepThresholdPermille and kStepMaxDurationMs are configured in
+// app/board.h with the rest of the Phase 1 tunables. They were written here because
+// board.h was not writable at the time; the reasoning that matters for this class is
+// recorded next to them, and the three facts this header depends on are:
 //
-// 128 records at 16 bytes is 2 KB, a tenth of the part's RAM, and that is the honest cost
-// of not allocating a variable-size buffer on a part that cannot afford one. It is sized
-// for the fast case, not the slow one: a 10 ms control period fills it in 1.28 s, which is
-// long enough for a soil-moisture loop, while at the 100 ms period the app task runs today
-// it holds 12.8 s. A bring-up session that needs a longer window needs a slower period or
-// a bigger buffer, and the analyser says when a capture ended before settling rather than
-// pretending it settled.
-//
-// These three values are tunables in the sense app/board.h uses the word, and belong there
-// alongside kAdcBlockSamples once the control period they depend on is decided; they live
-// here for now because that decision is open and board.h is not this change's to edit.
-constexpr size_t kStepCaptureCapacity = 128;
-
-// How far the setpoint must move from its armed value to count as a step, in the same
-// units as the setpoint (permille of soil moisture here, so this is 5 % of the full span).
-// A threshold rather than an exact comparison because the setpoint is a value a host can
-// nudge, and a one-count change is a typo, not a step response.
-constexpr int32_t kStepThresholdPermille = 50;
-
-// How long a capture may run after the step, in milliseconds. Measured from the step, not
-// from arming: arming early is the normal case and must not consume the window.
-constexpr uint32_t kStepMaxDurationMs = 30'000;
+//   - the capacity is the RAM bound (128 records x 16 bytes = 2 KB), so a capture cannot
+//     grow without someone deciding to spend the RAM;
+//   - the threshold is in the setpoint's own units, so a host nudging the setpoint by one
+//     count is not mistaken for a step;
+//   - the duration is measured from the step, not from arming, because arming early is
+//     the normal case.
 
 // One sample of the response.
 //

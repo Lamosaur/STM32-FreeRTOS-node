@@ -37,27 +37,19 @@
 
 namespace node {
 
-// The largest measurement a series will record, in microseconds. Anything above it is
-// recorded as the ceiling and counted in oversized_samples(), so a period or a latency of
-// a second is visible as "some samples hit the ceiling" rather than being folded into the
-// mean as if it were 1 s exactly.
+// kTimingMaxValueUs and kTimingWindowSamples are the two bounds on a measurement window.
+// They are configured in app/board.h with the rest of the Phase 1 tunables (this header
+// used to carry them, before board.h was written), because the window length is a property
+// of the measurement plan rather than of this class: the fast bound is the arithmetic
+// guarantee below — the sums stay exact only while the window is finite — and the slow
+// bound is how long a run reports for, which is a question about NFR-0.7 rather than about
+// statistics.
 //
-// One second rather than something tighter because the period being measured is itself
-// around 100 ms today: a ceiling closer to the nominal would clamp the very excursions the
-// measurement is looking for.
-constexpr uint32_t kTimingMaxValueUs = 1'000'000;
-
-// Samples per measurement window. At a 100 ms control period this is about 3.4 minutes of
-// running; at 10 ms, about 20 seconds. The window is bounded rather than unbounded because
-// of the arithmetic guarantee below: the sums stay exact only while the window is finite,
-// and a number that silently starts wrapping after four and a half hours unattended
-// (NFR-0.7 is a 72 h run) would be worse than no number.
-//
-// When the window is full, further samples are ignored and full() says so, so the caller
-// reports and resets. Ignoring rather than re-arming automatically is deliberate: an
-// automatic reset would silently discard the window that was being accumulated, and the
-// caller that never reports would never learn that it had lost the data.
-constexpr uint32_t kTimingWindowSamples = 2048;
+// Their behaviour, stated here because it is this class that implements it: when the
+// window is full, further samples are ignored and full() says so, so the caller reports and
+// resets. Ignoring rather than re-arming automatically is deliberate — an automatic reset
+// would silently discard the window being accumulated, and a caller that never reports
+// would never learn it had lost the data.
 
 // Histogram bucket edges, in microseconds of deviation from the nominal. Explicit edges
 // rather than an even split, because the interesting question is not "how wide is the
@@ -145,11 +137,12 @@ constexpr size_t kTimingBucketsPerLine = 6;
 
 // The nominal control period, used only to turn a measured period into a deviation.
 //
-// Defaults to the app task's period from board.h, which design-spec.md §5.1 says becomes
-// the Phase 1 control period. The real control period is not decided yet — it is set by a
-// hardware timer and belongs with the control law, which is deliberately not implemented —
-// so this is a default to be replaced, not a claim about the loop.
-constexpr uint32_t kDefaultNominalPeriodUs = task_period_ms(TaskId::App) * 1000U;
+// This now comes from the decided control period in board.h (1 s, design-spec.md §6.1)
+// rather than from the app task's period, which is what it used to fall back to while the
+// control period was undecided. The two disagreed the moment the decision was made, and a
+// nominal of 100 ms against a real period of 1 s would have reported every sample as a
+// 900 ms deviation — a jitter figure that is entirely an artefact of the wrong constant.
+constexpr uint32_t kDefaultNominalPeriodUs = kControlPeriodMs * 1000U;
 
 class TimingService {
  public:

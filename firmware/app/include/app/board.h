@@ -213,10 +213,235 @@ constexpr uint16_t kProbeCountsDry = 3'600;
 constexpr uint16_t kProbeCountsWet = 1'400;
 
 // ---------------------------------------------------------------------------
+// Phase 1 — instrumentation tunables
+// ---------------------------------------------------------------------------
+// The two recorders — period/latency statistics (NFR-1.8, NFR-1.9) in app/timing.h and
+// the step-response capture (FR-1.5) in app/step_capture.h — were written before this
+// file was writable, so their tunables ended up in their own headers. They are tunables
+// in exactly the sense this file uses the word: properties of the node's Phase 1
+// configuration, reviewed here against the measurement plan, rather than implementation
+// details of the code that consumes them. They are stated once, here; the two headers
+// alias them and explain what each one bounds.
+
+// Records in one step-response capture.
+//
+// 128 records at 16 bytes is 2 KB — a tenth of the F103C8T6's 20 KB of RAM — and that is
+// the honest cost of not allocating a variable-size buffer on a part that cannot afford
+// one. It is deliberately sized for the fast case and not the slow one: it has to hold a
+// response that settles, so a faster control period needs a bigger buffer or a shorter
+// capture, and the host analyser says "not settled in the captured window" rather than
+// inventing a settling time when the buffer fills first.
+constexpr size_t kStepCaptureCapacity = 128;
+
+// How far the setpoint must move from its armed value to count as a step, in the
+// setpoint's own units (permille of soil moisture, so this is 5 % of the full span).
+// A threshold rather than an exact comparison because the setpoint is a value a host can
+// nudge over the link, and a one-count change is a typo, not a step response.
+constexpr int32_t kStepThresholdPermille = 50;
+
+// How long a capture may run after the step, in milliseconds. Measured from the step,
+// not from arming: arming early is the normal case (the recorder is armed, then the host
+// commands a new setpoint) and must not consume the window.
+constexpr uint32_t kStepMaxDurationMs = 30'000;
+
+// Samples per timing measurement window.
+//
+// The window is bounded rather than unbounded because of the arithmetic guarantee in
+// app/timing.cpp: the sums stay exact only while the window is finite, and a statistic
+// that silently starts wrapping after four and a half hours unattended — NFR-0.7 is a
+// 72 h run — would be worse than no statistic at all. When the window is full, further
+// samples are ignored and full() says so, so the caller reports and resets rather than
+// losing the window silently.
+constexpr uint32_t kTimingWindowSamples = 1024;
+
+// The largest measurement a timing series will record, in microseconds. Anything above it
+// is recorded as the ceiling and counted in oversized_samples(), so an excursion is
+// visible as "some samples hit the ceiling" rather than being folded into the mean as if
+// it were the ceiling.
+//
+// Two seconds, which is twice the 1 s control period this measures. Both bounds were
+// chosen together, and the pairing is the point:
+//
+//   * The ceiling must sit well ABOVE the nominal. It was 1 s while the nominal was the
+//     100 ms app task period — that is, ten times the value being measured. Once the
+//     control period became 1 s, a 1 s ceiling would have clamped to exactly the nominal
+//     every excursion above it, which is precisely what NFR-1.8 looks for. A jitter
+//     measurement that hides its own tail is worse than no measurement.
+//   * The window has to shrink to pay for it. The mean and standard deviation come from
+//     uint64 sum and sum-of-squares, and with n samples bounded at x the two intermediates
+//     are n*sum(x^2) and (sum x)^2, both n^2*x^2/4 or less. At 2048 x 2,000,000 those
+//     reach 1.68e19 against a uint64 maximum of 1.84e19 — 91 % of the range, with no room
+//     for the arithmetic to be reasoned about. At 1024 x 2,000,000 they reach 4.19e18,
+//     which is 23 %, the same margin the original pairing had.
+//
+// 1024 seconds of history is still 17 minutes at this period, which is ample for a
+// worst-case figure; the window is a diagnostic aid, not a log.
+constexpr uint32_t kTimingMaxValueUs = 2'000'000;
+
+// ---------------------------------------------------------------------------
+// Phase 1 — closed-loop control
+// ---------------------------------------------------------------------------
+// The controlled variable is soil moisture in permille of the probe's calibrated span
+// (the Phase 1 analog channel: 0 is air-dry, 1000 is saturated). The I2C temperature and
+// humidity readings stay monitored-only — they are inputs to a report, not to the loop.
+//
+// The numbers below are a decision record, not a tuning session. They are duplicated
+// here in the form the code is written against, so that a reviewer of the control law and
+// a reviewer of the decision cannot end up looking at different values:
+//
+//   1. controlled variable  soil moisture permille from AcquisitionService
+//   2. setpoint             450 permille (45.0 %), runtime-tunable (FR-1.4)
+//   3. control period       1000 ms
+//   4. output               time-proportioned: on for duty x window, not fast PWM
+//   5. minimum on-time      50 ms; a computed on-time in (0, 50) ms becomes 0
+//   6. maximum duty         500 permille (50 % of the window)
+//   7. control law          PID with kd defaulting to 0, integral clamped
+//   8. fail-safe            an absent or stale reading forces the output to 0
+//   9. tuning publication   snapshot plus atomic index swap, never a mutex
+//  10. no 1 kHz control loop
+//
+// The period is 1000 ms and is deliberately not 1 kHz: a 1 kHz control loop on this part
+// would put a PID evaluation, a setpoint read and a gate decision on a 1 ms deadline that
+// the scheduling measurements cannot yet show is achievable, and soil moisture has no
+// information above a few Hz to control on. 1000 ms is also what makes the output
+// time-proportioned rather than PWM: the window is the period.
+constexpr uint32_t kControlPeriodMs = 1'000;
+
+constexpr int32_t kControlSetpointPermille = 450;
+
+// A window whose computed on-time is nonzero but shorter than this is skipped entirely
+// rather than delivered. A 49 ms pulse does not make a pump deliver 4.9 % of its rated
+// flow: below the minimum the pump does not prime, the gate driver's rise time is a
+// measurable fraction of the pulse, and the delivered volume becomes a property of the
+// plumbing rather than of the commanded number. Zero is the honest command, and the skip
+// is counted so that a loop living entirely below the threshold is visible as "every
+// window is being skipped" instead of as a mysterious failure to act.
+constexpr uint32_t kControlMinOnTimeMs = 50;
+
+// Half the window. The cap is what keeps a saturated controller from holding the pump on
+// for the whole period, and it is also what bounds the integral's authority below.
+constexpr int32_t kControlMaxDutyPermille = 500;
+
+// PID gains, in the fixed-point convention the loop's arithmetic uses (there is no float
+// anywhere in this firmware: the F103 has no FPU, so a float would mean soft-float
+// library calls for a number that is printed with three digits).
+//
+//   P_duty_permille = kp_milli * error_permille / 1000
+//   I_duty_permille = ki_milli * integral_permille_seconds / 1000
+//   D_duty_permille = kd_milli * (error - previous_error) * 1000 / dt_ms / 1000
+//
+// So kp_milli = 2000 means 2.0 duty-permille per error-permille: a 150 permille error
+// commands 300 permille of duty. ki_milli = 50 means a 145 permille error sustained for
+// 20 s contributes 145 permille of duty — the worked example the gains were chosen from.
+//
+// kd defaults to 0 and is off for a reason rather than by omission: the measurement is an
+// averaged 12-bit reading whose noise the derivative term multiplies. The D term is left
+// in the interface (FR-1.4 makes it runtime-settable) because a plant with a long dead
+// time and a noisy sensor is exactly where the argument for and against it is made with
+// numbers, and tests/test_control.cpp produces that measurement rather than assuming it.
+constexpr int32_t kControlDefaultKpMilli = 2'000;
+constexpr int32_t kControlDefaultKiMilli = 50;
+constexpr int32_t kControlDefaultKdMilli = 0;
+
+// Bounds for runtime tuning (FR-1.4). A value outside them is REFUSED with an error line
+// rather than clamped silently: a typed-in gain is a number a person believes, and
+// quietly installing 100 instead of the 1000 that was asked for produces a loop that
+// behaves differently from the one on the other end of the link, with nothing on the wire
+// to say so.
+//
+// The ranges are wide — 50x the default gain — because the useful gain depends on the
+// plant and on the pump, and a bound tight enough to be a tuning opinion would refuse
+// legitimate values. What they catch is a slipped decimal point, which is the mistake
+// that actually happens over a link.
+//
+// The setpoint is bounded by the calibration span, because "600 % soil moisture" is not a
+// fact about soil; the gains are bounded below at 0, because a negative kp is not a gain
+// but positive feedback (a drier reading would command less water), and the sign error is
+// invisible in the code and obvious only in a flooded pot.
+constexpr int32_t kControlMinSetpointPermille = 0;
+constexpr int32_t kControlMaxSetpointPermille = 1000;
+constexpr int32_t kControlMaxGainMilli = 100'000;
+
+// The integral clamp — the failure it prevents, and the one sentence of the decision
+// record this implementation had to interpret rather than transcribe.
+//
+// The failure: with a duty cap and slow percolation, the integrator winds up during the
+// dead time. The maintainer's worked example has it accumulating ~225 % of the duty the
+// plant actually needs over five minutes, and the surplus is then delivered after the
+// reading reaches the setpoint, which floods the pot.
+//
+// The decision: "clamp the integral to ±max_duty_permille". Read with
+// `integral_permille_seconds` as the thing being clamped — the state's own unit — the
+// limit is ±500 permille·s. At the default gains that state produces at most
+// ki_milli / 1000 x 500 = 25 duty-permille of output, and the consequences are not
+// subtle:
+//
+//   - 25 duty-permille is half of kControlMinOnTimeMs, so the integral alone can never
+//     command an on-time the actuator is willing to deliver. The static_assert below is
+//     exactly that comparison.
+//   - No steady state with error 0 is reachable at all. With error 0 the output is the
+//     integral, which cannot exceed 25 < 50, so the window is skipped, so the soil dries,
+//     so the error is positive again: the loop settles at least
+//     (kControlMinOnTimeMs - ki_milli x clamp / 1000) x 1000 / kp_milli = 12.5 permille
+//     below the setpoint, and further below for any plant whose demand exceeds 25.
+//   - It contradicts the worked example above, which needs an integral state of 2900
+//     permille·s after 20 s of a 145 permille error; a 500 permille·s clamp truncates it
+//     after 3.4 s.
+//
+// So the clamp is applied to the integral's *contribution*, which is the reading under
+// which the decided number — max_duty_permille, the actuator's own authority — bounds the
+// integrator's authority, and under which "~225 % of demand" is a statement about duty.
+// In the state's unit the limit is kControlIntegralClampDutyPermille x 1000 / ki_milli;
+// at the defaults that is 10,000 permille·s, and at ki = 50 the loop can hold the whole
+// 0..500 permille duty range with zero steady-state error. See
+// control_integral_state_limit() for the derivation and its ki = 0 case.
+//
+// This is the one place the implementation chose a reading rather than a value, and it is
+// recorded here because a one-line change would restore the literal one.
+constexpr int32_t kControlIntegralClampDutyPermille = kControlMaxDutyPermille;
+
+// The integral state's bound when ki_milli is 0, where the I term is identically zero and
+// the limit above is undefined (the derivation divides by ki). It is not an anti-windup
+// limit — with ki = 0 the state cannot affect the output at all — but the state keeps
+// accumulating because the update is unconditional, and an unbounded state would
+// eventually wrap; this is the point at which it stops. 1,000,000 permille·s is 11 days of
+// a 1 permille error or 17 minutes of a 1000 permille one, and it fits an int32 with room
+// for the multiplication below to be done in 64 bits.
+constexpr int32_t kControlIntegralStateGuardPermilleSeconds = 1'000'000;
+
+// The integral state limit that makes the integral's contribution at most
+// `max_duty_permille`: solve `ki_milli * state / 1000 = max_duty_permille` for the state.
+// Evaluated per update from the live tuning, so raising the cap at runtime raises the
+// integral's authority with it, and lowering ki re-clamps the state on the next
+// evaluation rather than leaving a stale, larger one in place.
+constexpr int32_t control_integral_state_limit(int32_t max_duty_permille,
+                                               int32_t ki_milli) {
+  if (ki_milli <= 0) {
+    return kControlIntegralStateGuardPermilleSeconds;
+  }
+  const int64_t limit = (static_cast<int64_t>(max_duty_permille) * 1000) / ki_milli;
+  // A limit below 1 would let the integral hold nothing at all; 1 is the smallest state
+  // that means anything. Validation keeps max_duty_permille positive, so this is a
+  // floor for defensive use rather than a reachable configuration.
+  return limit < 1 ? 1 : static_cast<int32_t>(limit);
+}
+
+// The check that decided the reading above: the integral's authority has to reach at
+// least the smallest on-time the actuator will deliver, or the integrator is decoration
+// and the loop carries a permanent offset. With the literal reading it fails (25 < 50);
+// with the implemented one it holds (500 >= 50). A future edit that lowers the cap or
+// raises the minimum on-time past this stops compiling, which is the moment to re-read
+// the commentary above rather than the moment to delete the assertion.
+static_assert(kControlIntegralClampDutyPermille >= static_cast<int32_t>(kControlMinOnTimeMs),
+              "the integral must be able to command at least a minimum on-time");
+
+// ---------------------------------------------------------------------------
 // Application thresholds
 // ---------------------------------------------------------------------------
 // Phase 0 has no actuator, so these only classify the reading for the display and the
-// telemetry line. They are where the Phase 1 control loop's setpoint will live.
+// telemetry line. The Phase 1 control loop's own setpoint is kControlSetpointPermille
+// above; these stay because they describe the I2C humidity reading, which the loop does
+// not use.
 constexpr int32_t kPlantDryMilliRh = 30'000; // below 30 %RH
 constexpr int32_t kPlantWetMilliRh = 70'000; // above 70 %RH
 
