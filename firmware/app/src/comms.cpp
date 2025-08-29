@@ -13,6 +13,123 @@ void append_literal(LineBuilder &builder, const char (&text)[N]) {
   builder.str(text);
 }
 
+// ---------------------------------------------------------------------------
+// `set` / `get`: the wire format for the tuning (FR-1.4)
+// ---------------------------------------------------------------------------
+// Every tunable is carried as a fixed-point decimal, and the units are chosen so that a
+// value `get` prints is a value `set` accepts unchanged. What a technician reads back has
+// to be what they can type back; a link where the reply is in different units from the
+// request is a link where a person's second action undoes their first.
+//
+//   sp    percent with at most two decimals   45.0  -> 450 permille
+//   max   percent with at most two decimals   50.0  -> 500 permille
+//   kp    3 decimals                          2.0   -> 2000 milli
+//   ki    3 decimals                          0.05  -> 50 milli
+//   kd    3 decimals                          0     -> 0
+//   min   milliseconds, no decimals           50
+//
+// The stored units are the loop's own (permille and milli-units), and the conversion is
+// exact by construction: each field declares the scale factor between the wire value in
+// thousandths and the stored value, and a value that is not a whole number of stored units
+// is refused rather than rounded. `set sp=45.05` is refused, because the controlled
+// variable's resolution is 1 permille and quietly storing 450 would leave the host and the
+// node disagreeing about what was set.
+
+// Parses a decimal in thousandths: "45.0" -> 45000, "-0.5" -> -500, "2" -> 2000.
+//
+// Deliberately hand-rolled rather than strtol with a float: a float here would pull
+// soft-float routines into the image for parsing (this part has no FPU), and strtol would
+// accept "2abc" and trailing whitespace, which is exactly how a mistyped command becomes a
+// silently applied one.
+bool parse_milli(const char *text, int32_t *out) {
+  // An upper bound on what will be parsed at all, before any field's range is considered.
+  // 10,000.000 is far above every field's maximum, so anything larger is a mistake in the
+  // number rather than in the tuning, and refusing it here keeps the accumulator below
+  // int32 regardless of how many digits were typed.
+  constexpr int64_t kParseLimitMilli = 10'000'000;
+
+  if (text == nullptr || out == nullptr || text[0] == '\0') {
+    return false;
+  }
+
+  const char *cursor = text;
+  bool negative = false;
+  if (*cursor == '-') {
+    negative = true;
+    ++cursor;
+  }
+
+  int64_t whole = 0;
+  size_t whole_digits = 0;
+  while (*cursor >= '0' && *cursor <= '9') {
+    whole = whole * 10 + (*cursor - '0');
+    ++whole_digits;
+    if (whole > kParseLimitMilli) {
+      return false;
+    }
+    ++cursor;
+  }
+
+  int64_t fraction = 0;
+  size_t fraction_digits = 0;
+  if (*cursor == '.') {
+    ++cursor;
+    while (*cursor >= '0' && *cursor <= '9') {
+      if (fraction_digits == 3) {
+        // Four decimals is more resolution than the milli unit has. Truncating would apply
+        // a different number from the one on the wire.
+        return false;
+      }
+      fraction = fraction * 10 + (*cursor - '0');
+      ++fraction_digits;
+      ++cursor;
+    }
+  }
+
+  // A sign, a point and nothing else is not a number.
+  if (whole_digits == 0 && fraction_digits == 0) {
+    return false;
+  }
+  if (*cursor != '\0') {
+    return false;
+  }
+
+  while (fraction_digits < 3) {
+    fraction *= 10;
+    ++fraction_digits;
+  }
+
+  const int64_t value = whole * 1000 + fraction;
+  if (value > kParseLimitMilli) {
+    return false;
+  }
+  *out = static_cast<int32_t>(negative ? -value : value);
+  return true;
+}
+
+// Converts a parsed milli-unit value into the stored unit, which is `unit_milli` thousandths
+// of the wire unit. Refuses a value that is not a whole number of stored units: see above.
+bool scale_milli(int32_t parsed, int32_t unit_milli, int32_t *out) {
+  if (unit_milli <= 0 || (parsed % unit_milli) != 0) {
+    return false;
+  }
+  *out = parsed / unit_milli;
+  return true;
+}
+
+bool key_matches(const char *key, size_t length, const char *name) {
+  return length == std::strlen(name) && std::strncmp(key, name, length) == 0;
+}
+
+// `name=value`. `value_milli` is the value in thousandths of the wire unit and `decimals`
+// is how many of them to print, so one helper renders both the reply to `get` and the
+// confirmation of a `set` — which is what keeps the two in the same units.
+LineBuilder &append_field(LineBuilder &line, const char *name, int32_t value_milli,
+                          uint32_t decimals) {
+  line.str(name).ch('=').fixed(value_milli, decimals);
+  return line;
+}
+
 } // namespace
 
 LineBuilder::LineBuilder(char *buffer, size_t capacity)
@@ -259,6 +376,153 @@ void CommsService::send_status() {
   send_line(line.c_str());
 }
 
+void CommsService::send_tuning() {
+  char buffer[kLineCapacity];
+  LineBuilder line(buffer, sizeof(buffer));
+
+  if (sources_.tuning == nullptr) {
+    // Not "the defaults": a host cannot tell defaults from a tuning it cannot read, and a
+    // node that reports numbers it is not using is worse than one that reports none.
+    send_line("tune unsupported");
+    return;
+  }
+
+  const ControlTuning tuning = sources_.tuning->load();
+  line.str("tune ");
+  append_field(line, "sp", tuning.setpoint_permille * 100, 2);
+  line.ch(' ');
+  append_field(line, "kp", tuning.kp_milli, 3);
+  line.ch(' ');
+  append_field(line, "ki", tuning.ki_milli, 3);
+  line.ch(' ');
+  append_field(line, "kd", tuning.kd_milli, 3);
+  line.ch(' ');
+  append_field(line, "min", static_cast<int32_t>(tuning.min_on_time_ms) * 1000, 0);
+  line.ch(' ');
+  append_field(line, "max", tuning.max_duty_permille * 100, 2);
+  send_line(line.c_str());
+}
+
+bool CommsService::handle_set(const char *argument) {
+  char buffer[kLineCapacity];
+
+  if (sources_.tuning == nullptr) {
+    stats_.tuning_refusals++;
+    send_line("err set: unsupported");
+    return true;
+  }
+
+  // Refusal, in one place so that every reason is counted and phrased the same way. The
+  // echo of what was typed is the whole value of the line: a host that sent six commands
+  // needs to know which one was rejected.
+  const auto refuse = [&](const char *reason) {
+    stats_.tuning_refusals++;
+    LineBuilder out(buffer, sizeof(buffer));
+    out.str("err set ").str(argument).str(": ").str(reason);
+    send_line(out.c_str());
+    return true;
+  };
+
+  const char *equals = std::strchr(argument, '=');
+  if (equals == nullptr || equals == argument || equals[1] == '\0') {
+    return refuse("expected key=value");
+  }
+
+  const char *key = argument;
+  const size_t key_length = static_cast<size_t>(equals - argument);
+  const char *value_text = equals + 1;
+
+  int32_t parsed = 0;
+  if (!parse_milli(value_text, &parsed)) {
+    return refuse("not a number");
+  }
+
+  ControlTuning next = sources_.tuning->load();
+  int32_t scaled = 0;
+  const char *canonical_name = nullptr;
+  uint32_t canonical_decimals = 0;
+
+  if (key_matches(key, key_length, "sp")) {
+    // The wire unit is percent, so the stored permille is a hundredth of the parsed
+    // thousandths. 45.0 is 450 permille; 45.05 has no representation and is refused.
+    if (!scale_milli(parsed, 100, &scaled)) {
+      return refuse("too precise: setpoint is in permille (one decimal in percent)");
+    }
+    next.setpoint_permille = scaled;
+    canonical_name = "sp";
+    canonical_decimals = 2;
+  } else if (key_matches(key, key_length, "kp")) {
+    if (!scale_milli(parsed, 1, &scaled)) {
+      return refuse("not a number");
+    }
+    next.kp_milli = scaled;
+    canonical_name = "kp";
+    canonical_decimals = 3;
+  } else if (key_matches(key, key_length, "ki")) {
+    if (!scale_milli(parsed, 1, &scaled)) {
+      return refuse("not a number");
+    }
+    next.ki_milli = scaled;
+    canonical_name = "ki";
+    canonical_decimals = 3;
+  } else if (key_matches(key, key_length, "kd")) {
+    if (!scale_milli(parsed, 1, &scaled)) {
+      return refuse("not a number");
+    }
+    next.kd_milli = scaled;
+    canonical_name = "kd";
+    canonical_decimals = 3;
+  } else if (key_matches(key, key_length, "min")) {
+    if (!scale_milli(parsed, 1000, &scaled)) {
+      return refuse("too precise: the minimum on-time is whole milliseconds");
+    }
+    if (scaled < 0) {
+      return refuse("out of range");
+    }
+    next.min_on_time_ms = static_cast<uint32_t>(scaled);
+    canonical_name = "min";
+    canonical_decimals = 0;
+  } else if (key_matches(key, key_length, "max")) {
+    if (!scale_milli(parsed, 100, &scaled)) {
+      return refuse("too precise: the duty cap is in permille (one decimal in percent)");
+    }
+    next.max_duty_permille = scaled;
+    canonical_name = "max";
+    canonical_decimals = 2;
+  } else {
+    return refuse("unknown key (sp, kp, ki, kd, min, max)");
+  }
+
+  // The whole resulting set is validated, not just the field that was typed: the limits are
+  // validated as a pair, so `set min=900` can be refused because of `max`. The field named
+  // in the refusal is therefore the field the *resulting tuning* is invalid because of,
+  // which is not always the one that was typed — and that is the useful information, since
+  // it is the number that has to change.
+  const TuningField invalid = tuning_error(next);
+  if (invalid != TuningField::None) {
+    return refuse(to_string(invalid));
+  }
+
+  if (!sources_.tuning->publish(next)) {
+    // Unreachable: the set above was validated by the same rule the store applies. Kept
+    // because the store is the writer's only guarantee and a silent failure to publish would
+    // be a host believing a value it never installed.
+    return refuse("refused by the tuning store");
+  }
+
+  stats_.tuning_sets++;
+  LineBuilder out(buffer, sizeof(buffer));
+  // The confirmation echoes the value in the same units `get` uses — `fixed()` takes
+  // thousandths of the wire unit, which is exactly what was parsed — so a host that sent
+  // `set sp=45.0` reads back the normalised `set sp=45.00 ok` and can see the value it
+  // actually installed.
+  out.str("set ");
+  append_field(out, canonical_name, parsed, canonical_decimals);
+  out.str(" ok");
+  send_line(out.c_str());
+  return true;
+}
+
 bool CommsService::handle_command(const char *line) {
   if (line == nullptr || line[0] == '\0') {
     return false;
@@ -282,6 +546,15 @@ bool CommsService::handle_command(const char *line) {
     return true;
   }
 
+  if (std::strcmp(line, "get") == 0) {
+    send_tuning();
+    return true;
+  }
+
+  if (std::strncmp(line, "set ", 4) == 0) {
+    return handle_set(line + 4);
+  }
+
   if (std::strcmp(line, "recover") == 0) {
     // Forces the FR-0.3 sequence on demand, so a held bus can be released without a
     // power cycle while someone watches the scope.
@@ -298,7 +571,7 @@ bool CommsService::handle_command(const char *line) {
   }
 
   if (std::strcmp(line, "help") == 0) {
-    send_line("cmd ver | stat | recover | help");
+    send_line("cmd ver | stat | get | set <k=v> | recover | help");
     return true;
   }
 

@@ -11,7 +11,10 @@
  *
  * The command set is deliberately small and is aimed at bring-up rather than features.
  * `recover` in particular exists so that FR-0.3 can be exercised on demand: hold the bus
- * with a jumper, issue the command, and watch the nine clock pulses on a scope.
+ * with a jumper, issue the command, and watch the nine clock pulses on a scope. `set` and
+ * `get` are the FR-1.4 path — the setpoint, gains and duty limits of the control loop,
+ * changed without reflashing — and they are the one part of this link that writes to
+ * something the control task reads.
  */
 #ifndef APP_COMMS_H
 #define APP_COMMS_H
@@ -20,6 +23,7 @@
 #include <cstdint>
 
 #include "app/board.h"
+#include "app/control.h"
 #include "app/display.h"
 #include "app/i2c_arbiter.h"
 #include "app/sensor.h"
@@ -78,6 +82,8 @@ struct CommsStats {
   uint32_t unknown_commands = 0;
   uint32_t write_failures = 0;
   uint32_t rx_overflows = 0; // a command longer than the line buffer was discarded
+  uint32_t tuning_sets = 0;      // `set` commands that changed the published tuning
+  uint32_t tuning_refusals = 0;  // `set` commands refused, for any reason
 };
 
 struct CommsSources {
@@ -87,6 +93,15 @@ struct CommsSources {
   const hal_system_iface_t *system = nullptr;
   const DisplayStats *display = nullptr;
   const NodeIdentity *identity = nullptr;
+
+  // The setpoint, gains and limits (FR-1.4). Not const, unlike the sources above, because
+  // this task is the *writer*: the whole point of the command is that the host changes the
+  // loop's tuning without a reflash, and a const source would only be readable.
+  //
+  // Appended at the end of the struct rather than next to the others so that the positional
+  // aggregate initialisers at existing call sites keep meaning what they meant; a field
+  // inserted in the middle would silently rebind every initialiser after it.
+  ControlTuningStore *tuning = nullptr;
 };
 
 class CommsService {
@@ -124,6 +139,16 @@ class CommsService {
  private:
   void drain_input();
   void send_status();
+
+  // The `get` command: the published tuning, in the units `set` accepts, so that what a host
+  // reads back is a line it can send again unchanged.
+  void send_tuning();
+
+  // The `set` command, with `argument` pointing at the text after "set ". Returns true
+  // (the verb was understood) whether the value was accepted or refused: a refusal is
+  // reported on the wire and counted, and the alternative — reporting a refused `set` as an
+  // unknown command — would tell a host its syntax was wrong when its number was.
+  bool handle_set(const char *argument);
 
   hal_uart_iface_t *uart_;
   I2cArbiter *arbiter_;
