@@ -12,6 +12,7 @@
 #include <string>
 
 #include "app/comms.h"
+#include "app/control.h"
 #include "app/i2c_arbiter.h"
 #include "app/i2c_recovery.h"
 #include "support/fake_i2c.h"
@@ -93,6 +94,7 @@ class CommsTest : public ::testing::Test {
     sources.arbiter = &arbiter;
     sources.sensor = &sensor;
     sources.identity = &identity;
+    sources.tuning = &tuning_store;
     service = std::make_unique<CommsService>(uart.iface(), &arbiter, rtos.iface(), sources);
   }
 
@@ -103,6 +105,7 @@ class CommsTest : public ::testing::Test {
   I2cRecovery recovery{bus.iface()};
   I2cArbiter arbiter{bus.iface(), rtos.iface(), &recovery};
   SensorService sensor{&arbiter, rtos.iface()};
+  ControlTuningStore tuning_store;
   NodeIdentity identity;
   CommsSources sources;
   std::unique_ptr<CommsService> service;
@@ -141,14 +144,20 @@ TEST_F(CommsTest, RecognisesTheCommandSet) {
   EXPECT_TRUE(service->handle_command("stat"));
   EXPECT_TRUE(service->handle_command("recover"));
   EXPECT_TRUE(service->handle_command("help"));
+  EXPECT_TRUE(service->handle_command("get"));
+  EXPECT_TRUE(service->handle_command("set sp=45.0"));
 
-  EXPECT_EQ(service->stats().commands_received, 4u);
+  EXPECT_EQ(service->stats().commands_received, 6u);
   EXPECT_EQ(service->stats().unknown_commands, 0u);
 
   const std::string out = uart.transmitted();
   EXPECT_NE(out.find("ver 0.1.0"), std::string::npos);
   EXPECT_NE(out.find("STAT"), std::string::npos);
   EXPECT_NE(out.find("recover"), std::string::npos);
+  EXPECT_NE(out.find("tune sp=45.00"), std::string::npos);
+  // The help line has to mention the commands a host can send, or a bring-up session that
+  // starts with `help` never learns that the loop can be tuned over the link.
+  EXPECT_NE(out.find("set <k=v>"), std::string::npos);
 }
 
 TEST_F(CommsTest, RecoverCommandForcesTheBusReleaseOnDemand) {
@@ -202,6 +211,183 @@ TEST_F(CommsTest, AnOverlongCommandIsRejectedRatherThanTruncated) {
   EXPECT_EQ(service->stats().commands_received, 0u);
   EXPECT_EQ(service->stats().rx_overflows, 1u);
   EXPECT_NE(uart.transmitted().find("err command too long"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime tuning over the link (FR-1.4)
+// ---------------------------------------------------------------------------
+// The point of these commands is that the setpoint and gains can be changed without
+// reflashing, so the tests assert what a host would actually receive *and* what the control
+// task would subsequently read, because a link that reports success while leaving the loop
+// on its old tuning is the failure that matters.
+
+TEST_F(CommsTest, GetReportsTheTuningInTheUnitsSetAccepts) {
+  ASSERT_TRUE(service->handle_command("get"));
+
+  EXPECT_NE(uart.transmitted().find("tune sp=45.00 kp=2.000 ki=0.050 kd=0.000 min=50 max=50.00"),
+            std::string::npos);
+}
+
+TEST_F(CommsTest, SetChangesEveryFieldWithoutAReflash) {
+  EXPECT_TRUE(service->handle_command("set sp=30.0"));
+  EXPECT_TRUE(service->handle_command("set kp=2.5"));
+  EXPECT_TRUE(service->handle_command("set ki=0.1"));
+  EXPECT_TRUE(service->handle_command("set kd=0.5"));
+  EXPECT_TRUE(service->handle_command("set min=60"));
+  EXPECT_TRUE(service->handle_command("set max=20.0"));
+
+  // What the control task will read on its next evaluation.
+  const ControlTuning tuning = tuning_store.load();
+  EXPECT_EQ(tuning.setpoint_permille, 300);
+  EXPECT_EQ(tuning.kp_milli, 2500);
+  EXPECT_EQ(tuning.ki_milli, 100);
+  EXPECT_EQ(tuning.kd_milli, 500);
+  EXPECT_EQ(tuning.min_on_time_ms, 60u);
+  EXPECT_EQ(tuning.max_duty_permille, 200);
+
+  EXPECT_EQ(service->stats().tuning_sets, 6u);
+  EXPECT_EQ(service->stats().tuning_refusals, 0u);
+
+  // The confirmation is the normalised value, in the units `get` uses, so a host that sent
+  // `sp=30.0` can see that 30.00 is what it installed.
+  const std::string out = uart.transmitted();
+  EXPECT_NE(out.find("set sp=30.00 ok"), std::string::npos);
+  EXPECT_NE(out.find("set min=60 ok"), std::string::npos);
+}
+
+TEST_F(CommsTest, ARefusedSetIsReportedAndLeavesTheTuningAlone) {
+  ASSERT_TRUE(service->handle_command("set sp=45.0"));
+  uart.clear_transmitted();
+
+  // Out of the calibration span. The refusal names the field the resulting tuning is
+  // invalid because of, which is what a person has to change.
+  EXPECT_TRUE(service->handle_command("set sp=120.0"));
+  EXPECT_NE(uart.transmitted().find("err set sp=120.0: setpoint"), std::string::npos);
+
+  uart.clear_transmitted();
+  // Finer than the controlled variable's resolution: refusing beats storing 450 for a
+  // request of 45.05 and leaving the host believing otherwise.
+  EXPECT_TRUE(service->handle_command("set sp=45.05"));
+  EXPECT_NE(uart.transmitted().find("too precise"), std::string::npos);
+
+  uart.clear_transmitted();
+  // A negative gain is positive feedback, and the sign error is invisible in the code.
+  EXPECT_TRUE(service->handle_command("set kp=-1"));
+  EXPECT_NE(uart.transmitted().find("err set kp=-1: kp"), std::string::npos);
+
+  uart.clear_transmitted();
+  EXPECT_TRUE(service->handle_command("set kp=abc"));
+  EXPECT_NE(uart.transmitted().find("not a number"), std::string::npos);
+
+  uart.clear_transmitted();
+  EXPECT_TRUE(service->handle_command("set frob=1"));
+  EXPECT_NE(uart.transmitted().find("unknown key"), std::string::npos);
+
+  uart.clear_transmitted();
+  EXPECT_TRUE(service->handle_command("set sp"));
+  EXPECT_NE(uart.transmitted().find("expected key=value"), std::string::npos);
+
+  // The `set` verb was understood in every case, so none of these is an unknown command:
+  // telling a host its syntax was wrong when its number was sends it to the wrong place.
+  EXPECT_EQ(service->stats().unknown_commands, 0u);
+  EXPECT_EQ(service->stats().tuning_sets, 1u);
+  EXPECT_EQ(service->stats().tuning_refusals, 6u);
+
+  const ControlTuning tuning = tuning_store.load();
+  EXPECT_EQ(tuning.setpoint_permille, 450);
+  EXPECT_EQ(tuning.kp_milli, 2000);
+}
+
+TEST_F(CommsTest, WhatGetPrintsIsWhatSetAccepts) {
+  // A reply a host cannot send back is a reply that has to be translated by whoever reads
+  // it, and that translation is where a unit error lives. This test takes `get`'s own
+  // words, splits them out, and feeds them back.
+  ASSERT_TRUE(service->handle_command("set sp=37.5"));
+  ASSERT_TRUE(service->handle_command("set kp=1.75"));
+  ASSERT_TRUE(service->handle_command("set min=80"));
+  ASSERT_TRUE(service->handle_command("set max=12.5"));
+  uart.clear_transmitted();
+
+  ASSERT_TRUE(service->handle_command("get"));
+  std::string printed = uart.transmitted();
+  ASSERT_FALSE(printed.empty());
+  EXPECT_EQ(printed.back(), '\n');
+  printed.pop_back();
+  ASSERT_EQ(printed.compare(0, 5, "tune "), 0);
+
+  const ControlTuning before = tuning_store.load();
+  size_t fields_sent = 0;
+  size_t cursor = 5;
+  while (cursor < printed.size()) {
+    const size_t space = printed.find(' ', cursor);
+    const std::string field = printed.substr(cursor, space - cursor);
+    EXPECT_TRUE(service->handle_command(("set " + field).c_str())) << field;
+    ++fields_sent;
+    if (space == std::string::npos) {
+      break;
+    }
+    cursor = space + 1;
+  }
+
+  EXPECT_EQ(fields_sent, 6u);
+  EXPECT_EQ(service->stats().tuning_refusals, 0u);
+
+  const ControlTuning after = tuning_store.load();
+  EXPECT_EQ(after.setpoint_permille, before.setpoint_permille);
+  EXPECT_EQ(after.kp_milli, before.kp_milli);
+  EXPECT_EQ(after.ki_milli, before.ki_milli);
+  EXPECT_EQ(after.min_on_time_ms, before.min_on_time_ms);
+  EXPECT_EQ(after.max_duty_permille, before.max_duty_permille);
+}
+
+TEST_F(CommsTest, EveryTuningLineFitsTheLineBuffer) {
+  // kCommsRxBufferBytes is the buffer the receiver fills and the line builder writes into
+  // (LineBuilder truncates silently rather than overflowing), so a line that did not fit
+  // would arrive at the host clipped — and a clipped tuning line is a plausible wrong
+  // number. The widest case is every field at its maximum.
+  ASSERT_TRUE(service->handle_command("set sp=100.0"));
+  ASSERT_TRUE(service->handle_command("set kp=100.0"));
+  ASSERT_TRUE(service->handle_command("set ki=100.0"));
+  ASSERT_TRUE(service->handle_command("set kd=100.0"));
+  ASSERT_TRUE(service->handle_command("set min=1000"));
+  ASSERT_TRUE(service->handle_command("set max=100.0"));
+  uart.clear_transmitted();
+
+  ASSERT_TRUE(service->handle_command("get"));
+
+  const std::string out = uart.transmitted();
+  EXPECT_NE(out.find("\n"), std::string::npos);
+  EXPECT_LT(out.size(), kCommsRxBufferBytes);
+  EXPECT_EQ(out.find('\n'), out.size() - 1); // one line, terminated once
+}
+
+TEST_F(CommsTest, TuningCommandsSaySoWhenThereIsNoTuningSource) {
+  // A node whose comms task has no tuning store still controls on the compiled-in defaults;
+  // what it must not do is report a tuning it cannot read or accept a set it cannot apply.
+  CommsSources without_tuning;
+  without_tuning.arbiter = &arbiter;
+  CommsService silent(uart.iface(), &arbiter, rtos.iface(), without_tuning);
+
+  EXPECT_TRUE(silent.handle_command("get"));
+  EXPECT_NE(uart.transmitted().find("tune unsupported"), std::string::npos);
+
+  uart.clear_transmitted();
+  EXPECT_TRUE(silent.handle_command("set sp=30.0"));
+  EXPECT_NE(uart.transmitted().find("err set: unsupported"), std::string::npos);
+  EXPECT_EQ(silent.stats().tuning_refusals, 1u);
+  EXPECT_EQ(silent.stats().tuning_sets, 0u);
+}
+
+TEST_F(CommsTest, ASetIsDispatchedFromTheWireLikeAnyOtherCommand) {
+  // The whole path, from bytes to published tuning: this is what FR-1.4 looks like from the
+  // host's side.
+  uart.push_rx("set sp=32.5\r\n");
+
+  service->update();
+
+  EXPECT_EQ(service->stats().commands_received, 1u);
+  EXPECT_EQ(tuning_store.load().setpoint_permille, 325);
+  EXPECT_NE(uart.transmitted().find("set sp=32.50 ok"), std::string::npos);
 }
 
 TEST_F(CommsTest, TelemetryIsEmittedOnceThenHeldToItsPeriod) {
