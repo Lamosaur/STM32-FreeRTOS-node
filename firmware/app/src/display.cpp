@@ -553,9 +553,9 @@ size_t write_region(I2cArbiter *bus, uint16_t addr7, const Framebuffer &fb,
   size_t sent = 0;
   for (uint8_t page = first_page; page <= last_page; ++page) {
     payload[0] = kCtrlCommand;
-    payload[1] = static_cast<uint8_t>(0xB0u | page); // set page start address
+    payload[1] = static_cast<uint8_t>(0xB0u | static_cast<uint32_t>(page)); // page addr
     payload[2] = static_cast<uint8_t>(x0 & 0x0Fu);   // set lower column start address
-    payload[3] = static_cast<uint8_t>(0x10u | ((x0 >> 4) & 0x0Fu)); // upper nibble
+    payload[3] = static_cast<uint8_t>(0x10u | ((static_cast<uint32_t>(x0) >> 4) & 0x0Fu));
     payload[4] = kCtrlData;
     for (uint16_t i = 0; i < width; ++i) {
       // Only the damaged columns of this page are copied, so the transaction length is

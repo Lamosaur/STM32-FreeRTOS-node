@@ -40,7 +40,9 @@ static volatile uint16_t s_rx_tail = 0U;
 static volatile uint32_t s_rx_overruns = 0U;
 
 static uint16_t uart_rx_count(void) {
-  return (uint16_t)((s_rx_head - s_rx_tail) & UART_RX_MASK);
+  /* The difference promotes to int; masking it against the unsigned capacity is an
+   * int-to-unsigned conversion, so the subtraction is done unsigned to begin with. */
+  return (uint16_t)((uint16_t)(s_rx_head - s_rx_tail) & (uint16_t)UART_RX_MASK);
 }
 
 /* ---------------------------------------------------------------------------

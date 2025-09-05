@@ -27,7 +27,9 @@ uint8_t Sht31::crc8(const uint8_t *data, size_t len) {
     crc ^= data[i];
     for (int bit = 0; bit < 8; ++bit) {
       if ((crc & 0x80U) != 0U) {
-        crc = static_cast<uint8_t>((crc << 1) ^ 0x31U);
+        // Cast before the shift: `crc << 1` promotes to int, and combining that with the
+        // unsigned polynomial is an int-to-unsigned conversion.
+        crc = static_cast<uint8_t>((static_cast<uint32_t>(crc) << 1) ^ 0x31U);
       } else {
         crc = static_cast<uint8_t>(crc << 1);
       }

@@ -144,7 +144,10 @@ void scan_bus() {
     char text[40];
     node::LineBuilder line(text, sizeof(text));
     line.str("  found 0x");
-    line.ch(hex[(addr >> 4) & 0x0FU]).ch(hex[addr & 0x0FU]);
+    // The promotions here are the same story as the CRC fix: uint16_t promotes to int,
+    // and the unsigned masks turn that into an int-to-unsigned conversion.
+    const uint32_t address = addr;
+    line.ch(hex[(address >> 4) & 0x0FU]).ch(hex[address & 0x0FU]);
     if (addr == node::kAddrSht31) {
       line.str("  (SHT31 sensor)");
     } else if (addr == node::kAddrSsd1306) {
