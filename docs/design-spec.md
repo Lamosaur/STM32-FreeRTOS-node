@@ -451,6 +451,30 @@ than this table, so the reasoning lives next to the code that depends on it.
 | 9 | Gains publication | **Snapshot + atomic swap, never a mutex.** A mutex here would put a lock acquisition inside the very loop whose jitter NFR-1.8 measures, and would itself be the priority-inversion case FR-1.7 exists to measure. | `app/include/app/control.h` |
 | 10 | 1 kHz | **Not** the control period. If that figure is wanted it is a separate, explicitly labelled scheduling test — presenting it as a control requirement would be the measurement plan flattering itself. | — |
 
+**Integral clamp — what "clamped" means, because the wording was ambiguous.** Decision 7
+says the integral is clamped to ±`max_duty_permille`. Read as a bound on the stored
+integral *state*, whose unit is permille-seconds, that gives the I term at most
+`ki/1000 × 500` = 25 duty-permille at the default gains — half the 50 ms minimum on-time.
+The loop then cannot hold any setpoint that needs more than 25 permille of duty, so "no
+steady-state error", which the same decision set requires, becomes unreachable: the
+simulated minimum offset is 12.5 permille on a perfectly matched plant and 61.5 permille on
+a realistic one. It also contradicts the worked example in the decision notes, which needs
+a state of 2900 permille-seconds after 20 s.
+
+So the clamp binds on the integral's **contribution** to the output, not on the state's own
+unit: the state limit is `max_duty_permille × 1000 / ki_milli`, re-derived from the live
+tuning on every update. The clamped quantity is then the same one the "~225 % of demand"
+figure describes. The clamp *value* is unchanged; only its referent is now stated. The
+arithmetic is encoded in a `static_assert` and a test asserts both readings, so restoring
+the literal reading is a one-line change if that was ever the intent.
+
+**Residual risk of the decided cap, as arithmetic rather than prose.** Bounding the
+integral at the actuator's authority means that after the reading crosses the setpoint the
+pump may stay on until the error reaches `−max_duty × 1000 / kp` = −250 permille. The
+worst-case over-watering these numbers permit is therefore a +250 permille overshoot; the
+simulated windup case gives +75. If that ceiling is too high for the pot, the knob is `kp`
+or the duty cap, not the clamp.
+
 **Verification consequence.** NFR-1.8 asks for control-loop period jitter without naming a
 rate, so it is satisfied honestly by measuring the jitter of the 1 s loop this plant
 needs. The 1 kHz expectation that an earlier revision of this section implied came from
