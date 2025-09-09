@@ -143,6 +143,24 @@ static bool clock_config(void) {
   }
   __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
 
+  /* ADCCLK = PCLK2 / 6 = 12 MHz.
+   *
+   * This is not decoration and it is not the reset default: RCC_CFGR.ADCPRE comes out of
+   * reset as 00, which is PCLK2 / 2 — 36 MHz here, against a datasheet maximum of 14 MHz.
+   * A part left at the default is running its successive-approximation converter at more
+   * than twice its rated clock, which does not announce itself: the conversions complete
+   * and return numbers, and what degrades is their accuracy, in a way that would be
+   * attributed to the probe or the wiring.
+   *
+   * It is set here, with the rest of the clock tree, rather than in the ADC module, because
+   * ADCPRE is part of CFGR: a peripheral that reprogrammed the clock tree from its own
+   * initialisation would make the system clock configuration impossible to read in one
+   * place. hal_adc_stm32f1.c's rate arithmetic assumes this value and its comment says so.
+   *
+   * 12 MHz is the F103's ceiling with the divisors available from a 72 MHz PCLK2 (2, 4, 6
+   * or 8), and it is what makes one conversion 84 ADCCLK cycles = 7.0 us. */
+  __HAL_RCC_ADC_CONFIG(RCC_ADCPCLK2_DIV6);
+
   return true;
 }
 
@@ -231,6 +249,57 @@ void hal_stm32f1_delay_us(uint32_t us) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The microsecond clock (hal/clock.h)
+ * ---------------------------------------------------------------------------
+ * The same DWT cycle counter delay_us() uses, divided by the core clock, exposed to the
+ * application so that app/timing.h can record NFR-1.8's period jitter and NFR-1.9's
+ * latency series. See hal/clock.h for why the application cannot read the counter itself
+ * and why the RTOS's millisecond clock is not a substitute.
+ *
+ * Two properties worth stating where the arithmetic is:
+ *
+ *   - The division is done on each read, not accumulated, so the error does not drift:
+ *     two reads 1,000,000 us apart differ by 1,000,000 +- 1 us, and the truncation is the
+ *     counter's own resolution (13.9 ns at 72 MHz), not a rounding mode.
+ *   - The DWT counter wraps every 2^32 cycles — 59.6 s at 72 MHz — which is *faster* than
+ *     the 71.6 minutes a 2^32-microsecond value would take, so the wrap is real and
+ *     frequent. Unsigned subtraction across it is still exact, because the truncation
+ *     happens after the subtraction in effect: (a - b) in cycles is exact modulo 2^32, and
+ *     dividing that difference by cycles-per-microsecond gives the same answer as
+ *     dividing the true difference for any interval below 59.6 s. That covers every
+ *     interval this firmware measures by three orders of magnitude; a consumer that ever
+ *     needs longer than a minute must count wraps.
+ *
+ * When the DWT is not counting (some clone silicon, or a debug unit that will not enable),
+ * this returns zero forever. That is deliberate rather than a fallback: a clock that
+ * silently became the millisecond tick would put a plausible-looking number into the
+ * jitter statistics, whereas a frozen zero makes every interval huge and obviously
+ * unusable. hal_stm32f1_delay_us() does need a fallback because it must return at all; a
+ * measurement is allowed to have nothing to say.
+ */
+static uint32_t clock_now_us(void *ctx) {
+  (void)ctx;
+
+  if (!s_dwt_ok) {
+    return 0U;
+  }
+  const uint32_t cycles_per_us = SystemCoreClock / 1000000U;
+  if (cycles_per_us == 0U) {
+    return 0U;
+  }
+  return DWT->CYCCNT / cycles_per_us;
+}
+
+static hal_clock_iface_t s_clock = {
+    .ctx = NULL,
+    .now_us = clock_now_us,
+};
+
+hal_clock_iface_t *hal_clock_stm32f1(void) {
+  return &s_clock;
+}
+
+/* ---------------------------------------------------------------------------
  * Low-level hardware init hook, called by HAL_Init()
  * ---------------------------------------------------------------------------
  * Only the always-needed clocks: the alternate-function IO block (for the I2C1 remap
@@ -270,8 +339,15 @@ void hal_stm32f1_init(void) {
   hal_system_stm32f1_count_boot();
 
   /* 6. Pins and peripherals. The watchdog is deliberately not started here: FR-0.4
-   *    requires the supervisor task to own that decision. */
+   *    requires the supervisor task to own that decision.
+   *
+   *    Order is by dependency: the GPIO table first (the I2C recovery path and the ADC's
+   *    MspInit both write pins), then the actuator, whose init() leaves the gate off for
+   *    the whole rest of the boot, then the ADC (armed but not triggered until start()),
+   *    then I2C and USART. */
   hal_stm32f1_gpio_init();
+  hal_actuator_stm32f1_init();
+  hal_adc_stm32f1_init();
   hal_i2c_stm32f1_init();
   hal_uart_stm32f1_init();
 }

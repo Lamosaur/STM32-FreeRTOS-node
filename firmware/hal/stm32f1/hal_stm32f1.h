@@ -27,14 +27,43 @@
  *                to FreeRTOS (the port's tick), so the HAL cannot have it; without a
  *                timebase that advances, every HAL timeout would hang forever, which is
  *                precisely the failure the bus recovery in FR-0.3 has to survive.
- *                TIM1/TIM2/TIM3 are left unclaimed for Phase 1's ADC trigger and PWM.
- *                Interrupt priority 6: numerically below FreeRTOS's
+ *                TIM2 is claimed by Phase 1 as the ADC trigger (see ADC1 below); TIM3 is
+ *                still free. Interrupt priority 6: numerically below FreeRTOS's
  *                configMAX_SYSCALL_INTERRUPT_PRIORITY (5) so it never preempts a
  *                kernel critical section, and it calls no FreeRTOS API.
  *
- *   DWT          Cycle counter, enabled in hal_stm32f1_init(). Two users: the microsecond
- *                delay (delay_us for the I2C recovery edges), and FreeRTOS run-time
+ *   DWT          Cycle counter, enabled in hal_stm32f1_init(). Three users: the microsecond
+ *                delay (delay_us for the I2C recovery edges), the microsecond clock the
+ *                application's timing service reads (hal/clock.h), and FreeRTOS run-time
  *                statistics for NFR-1.10.
+ *
+ *   ADC1         PA0 = ADC1_IN0, single conversion, timer-triggered, DMA into a circular
+ *                half-word buffer of 2 x block_samples. ADCCLK = PCLK2/6 = 12 MHz
+ *                (datasheet ceiling 14 MHz), sampling time 71.5 cycles, so one conversion
+ *                is 71.5 + 12.5 = 84 ADCCLK cycles = 7.0 us and the converter's ceiling is
+ *                ~142 kSPS at this sampling time. The sampling time is sized for a
+ *                ~10 kohm source: (1 kohm internal + 10 kohm) x 8 pF x ln(2^14) = 854 ns,
+ *                and 71.5 cycles is 5.96 us. The arithmetic and the AFE numbers are in
+ *                app/board.h, next to the constants the application is written against.
+ *                Trigger: TIM2 update event on TRGO (PSC 71, ARR 999 -> 1 kHz exactly from
+ *                72 MHz). Transfer: DMA1 Channel 1, which is hardwired to ADC1 on the F1
+ *                (there is no channel-select register, unlike later families), circular,
+ *                memory-increment, half-word, very high priority. Interrupt:
+ *                DMA1_Channel1 at priority 6 — the block callback takes no RTOS lock, so
+ *                it *could* legally sit above configMAX_SYSCALL_INTERRUPT_PRIORITY, and
+ *                the choice of 6 is the conservative one: a future edit that reaches for
+ *                a kernel call from the callback is then caught by the priority rule
+ *                rather than by corrupting the kernel.
+ *
+ *   Actuator     PA1, push-pull output, driven only through hal/actuator.h. The gate needs
+ *                an external pull-down (that header explains why the firmware cannot
+ *                substitute for one), and init() drives the pin low BEFORE configuring it
+ *                as an output, so there is no window in which an input-mode pin with an
+ *                indeterminate level is connected to the gate.
+ *
+ *   PA2          Reserved for Phase 4's probe power gate. Deliberately not configured as
+ *                anything: see app/board.h's pin table for why the probe does not need
+ *                gating for corrosion and does need it for the current budget.
  *
  *   I2C1         PB6 = SCL, PB7 = SDA, alternate function open drain, 400 kHz, 7-bit
  *                addressing, no remap (PB6/PB7 is the default mapping; the alternate
@@ -76,6 +105,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "hal/adc.h"
+#include "hal/actuator.h"
+#include "hal/clock.h"
 #include "hal/gpio.h"
 #include "hal/i2c.h"
 #include "hal/system.h"
@@ -87,11 +119,14 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * The five interface instances.
+ * The seven interface instances.
  * ---------------------------------------------------------------------------
  * Each is a singleton with static storage: the objects are created once during
  * hal_stm32f1_init() and never freed (NFR-0.7 forbids run-time allocation churn).
  */
+hal_adc_iface_t *hal_adc_stm32f1(void);
+hal_actuator_iface_t *hal_actuator_stm32f1(void);
+hal_clock_iface_t *hal_clock_stm32f1(void);
 hal_gpio_iface_t *hal_gpio_stm32f1(void);
 hal_i2c_iface_t *hal_i2c_stm32f1(void);
 hal_uart_iface_t *hal_uart_stm32f1(void);
@@ -145,6 +180,8 @@ bool hal_stm32f1_hse_ok(void);
 
 /* Per-peripheral bring-up, called in order by hal_stm32f1_init(). */
 void hal_stm32f1_gpio_init(void);
+void hal_adc_stm32f1_init(void);
+void hal_actuator_stm32f1_init(void);
 void hal_i2c_stm32f1_init(void);
 void hal_uart_stm32f1_init(void);
 

@@ -22,8 +22,14 @@ extern "C" {
  * __HAL_FLASH_PREFETCH_BUFFER_ENABLE() live in stm32f1xx_hal_flash.h, while the clock
  * setup uses the register macros directly and never calls into the flash driver, so
  * stm32f1xx_hal_flash.c is not compiled.
+ *
+ * HAL_ADC_MODULE_ENABLED pulls in stm32f1xx_hal_adc.h and, at the end of it,
+ * stm32f1xx_hal_adc_ex.h — which is where this family defines the regular-group external
+ * trigger names (ADC_EXTERNALTRIGCONV_T3_TRGO) and HAL_ADCEx_Calibration_Start, the two
+ * ADC symbols Phase 1 actually calls. Both .c files are compiled; see the CMakeLists.
  */
 #define HAL_MODULE_ENABLED
+#define HAL_ADC_MODULE_ENABLED
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
 #define HAL_FLASH_MODULE_ENABLED
@@ -107,6 +113,13 @@ extern "C" {
 #endif
 #ifdef HAL_DMA_MODULE_ENABLED
 #include "stm32f1xx_hal_dma.h"
+#endif
+/* After the DMA header, and it has to be: stm32f1xx_hal_adc.h declares callbacks that take
+ * a DMA_HandleTypeDef*, so it does not compile unless that type is already visible. The
+ * template orders these differently and gets away with it because it enables a different
+ * set of modules. */
+#ifdef HAL_ADC_MODULE_ENABLED
+#include "stm32f1xx_hal_adc.h"
 #endif
 #ifdef HAL_CORTEX_MODULE_ENABLED
 #include "stm32f1xx_hal_cortex.h"
