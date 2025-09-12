@@ -448,15 +448,28 @@ TEST_F(CommsTest, TelemetryDistinguishesNoSensorFromNoReading) {
 }
 
 TEST_F(CommsTest, TelemetryCarriesAValidReadingInFixedPoint) {
-  // Mid-scale on both channels: 0x8000 -> 42.501 C and 50.000 %RH, which with two
-  // decimals is what a host should read.
-  std::vector<uint8_t> reply(6, 0);
-  reply[0] = 0x80;
-  reply[1] = 0x00;
-  reply[2] = Sht31::crc8(reply.data(), 2);
-  reply[3] = 0x80;
-  reply[4] = 0x00;
-  reply[5] = Sht31::crc8(&reply[3], 2);
+  // 42.50 C and 50.00 %RH, which with two decimals is what a host should read.
+  //
+  // The raw values are chosen so the fixed-point conversion lands exactly:
+  //   humidity 50.000 %RH  -> raw = 0.5 * 2^20 = 524288 exactly
+  //   temperature 42.500 C -> raw such that raw * 200000 / 1048576 = 92500, i.e. raw in
+  //     [92500 * 1048576 / 200000, ...) = [484966.4, ...), so 484967 gives 92500 after the
+  //     truncation (92500.11 before it).
+  //
+  // The frame is the AHT20's: status, five data bytes packing 20 bits of each quantity, and
+  // one CRC over the first six. This replaced the SHT3x's six-byte reply when the sensor
+  // module on the bench turned out to be an AHT20 + BMP280 rather than an SHT31.
+  const uint32_t raw_temperature = 484'967;
+  const uint32_t raw_humidity = 524'288;
+  std::vector<uint8_t> reply(7, 0);
+  reply[0] = 0x08; // calibrated, not busy
+  reply[1] = static_cast<uint8_t>((raw_humidity >> 12) & 0xFFU);
+  reply[2] = static_cast<uint8_t>((raw_humidity >> 4) & 0xFFU);
+  reply[3] = static_cast<uint8_t>(((raw_humidity & 0x0FU) << 4) |
+                                  ((raw_temperature >> 16) & 0x0FU));
+  reply[4] = static_cast<uint8_t>((raw_temperature >> 8) & 0xFFU);
+  reply[5] = static_cast<uint8_t>(raw_temperature & 0xFFU);
+  reply[6] = Aht20::crc8(reply.data(), 6);
   bus.set_read_data(reply);
 
   ASSERT_TRUE(sensor.update());
@@ -475,7 +488,7 @@ TEST_F(CommsTest, TelemetryCarriesTheBusRecoveryCounters) {
   bus.hold_sda_low_for_clocks(3);
   bus.fail_transfers(1, HAL_I2C_BUS_ERROR);
   const uint8_t payload = 1;
-  ASSERT_EQ(arbiter.write(kAddrSht31, &payload, 1), BusResult::Ok);
+  ASSERT_EQ(arbiter.write(kAddrAht20, &payload, 1), BusResult::Ok);
 
   char buffer[kCommsRxBufferBytes];
   const size_t length = service->format_telemetry(buffer, sizeof(buffer));

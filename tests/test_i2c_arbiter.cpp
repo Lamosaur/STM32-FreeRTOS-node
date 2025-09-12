@@ -42,7 +42,7 @@ class ArbiterTest : public ::testing::Test {
 TEST_F(ArbiterTest, HealthyTransferUsesNoRecovery) {
   const uint8_t payload = 0xAB;
 
-  EXPECT_EQ(arbiter.write(kAddrSht31, &payload, 1), BusResult::Ok);
+  EXPECT_EQ(arbiter.write(kAddrAht20, &payload, 1), BusResult::Ok);
 
   const ArbiterStats stats = arbiter.stats();
   EXPECT_EQ(stats.transfers, 1u);
@@ -56,7 +56,7 @@ TEST_F(ArbiterTest, HealthyTransferUsesNoRecovery) {
 TEST_F(ArbiterTest, NackIsNotABusFaultAndDoesNotTriggerRecovery) {
   bus.set_transfer_status(HAL_I2C_NACK);
 
-  EXPECT_EQ(arbiter.write(kAddrSht31, nullptr, 0), BusResult::Nack);
+  EXPECT_EQ(arbiter.write(kAddrAht20, nullptr, 0), BusResult::Nack);
 
   // A device that does not answer is a fact about the device. Clocking the bus cannot
   // change it, so a NACK must not spend the recovery budget or emit bus edges.
@@ -78,10 +78,10 @@ TEST_F(ArbiterTest, BusErrorTriggersRecoveryThenOneRetry) {
   bus.fail_transfers(1, HAL_I2C_BUS_ERROR);
 
   const uint8_t payload = 0x11;
-  EXPECT_EQ(arbiter.write(kAddrSht31, &payload, 1), BusResult::Ok);
+  EXPECT_EQ(arbiter.write(kAddrAht20, &payload, 1), BusResult::Ok);
 
   EXPECT_EQ(bus.transfer_calls(), 2);
-  EXPECT_EQ(bus.transfer_addrs(), (std::vector<uint16_t>{kAddrSht31, kAddrSht31}));
+  EXPECT_EQ(bus.transfer_addrs(), (std::vector<uint16_t>{kAddrAht20, kAddrAht20}));
   EXPECT_EQ(bus.recoveries_run(), 1);
 
   const ArbiterStats stats = arbiter.stats();
@@ -110,7 +110,7 @@ TEST_F(ArbiterTest, UnrecoverableBusReportsBusError) {
   bus.hold_sda_low_for_clocks(kNeverRelease);
   bus.fail_transfers(100, HAL_I2C_BUS_ERROR);
 
-  EXPECT_EQ(arbiter.write(kAddrSht31, nullptr, 0), BusResult::BusError);
+  EXPECT_EQ(arbiter.write(kAddrAht20, nullptr, 0), BusResult::BusError);
 
   // One attempt, one recovery attempt that reported the bus unrecoverable, and no
   // pointless retry.
@@ -128,7 +128,7 @@ TEST_F(ArbiterTest, PersistentTimeoutIsReportedAsTimeout) {
   bus.set_transfer_status(HAL_I2C_TIMEOUT);
   // An idle bus: recovery reports NotNeeded, so the one retry still happens and still
   // fails, and the caller learns the real reason rather than a generic failure.
-  EXPECT_EQ(arbiter.write(kAddrSht31, nullptr, 0), BusResult::Timeout);
+  EXPECT_EQ(arbiter.write(kAddrAht20, nullptr, 0), BusResult::Timeout);
   EXPECT_EQ(bus.transfer_calls(), 2);
   EXPECT_EQ(bus.recoveries_run(), 0); // nothing to release, so nothing was driven
   EXPECT_EQ(arbiter.stats().bus_faults, 1u);
@@ -137,7 +137,7 @@ TEST_F(ArbiterTest, PersistentTimeoutIsReportedAsTimeout) {
 TEST_F(ArbiterTest, LockTimeoutReturnsUnavailable) {
   rtos.fail_next_lock();
 
-  EXPECT_EQ(arbiter.write(kAddrSht31, nullptr, 0), BusResult::Unavailable);
+  EXPECT_EQ(arbiter.write(kAddrAht20, nullptr, 0), BusResult::Unavailable);
 
   // The bus was never touched, so nothing was emitted on it.
   EXPECT_EQ(bus.transfer_calls(), 0);
@@ -159,7 +159,7 @@ TEST_F(ArbiterTest, ContendedAcquisitionIsCounted) {
   std::this_thread::sleep_for(std::chrono::milliseconds(5)); // let the holder win
 
   const uint8_t payload = 0x5A;
-  EXPECT_EQ(arbiter.write(kAddrSht31, &payload, 1), BusResult::Ok);
+  EXPECT_EQ(arbiter.write(kAddrAht20, &payload, 1), BusResult::Ok);
 
   holder.join();
 
@@ -189,7 +189,7 @@ TEST_F(ArbiterTest, ForceRecoveryRunsEvenOnAnIdleBus) {
 
 TEST_F(ArbiterTest, StatsResetIsClean) {
   const uint8_t payload = 1;
-  ASSERT_EQ(arbiter.write(kAddrSht31, &payload, 1), BusResult::Ok);
+  ASSERT_EQ(arbiter.write(kAddrAht20, &payload, 1), BusResult::Ok);
   ASSERT_EQ(arbiter.stats().transfers, 1u);
 
   arbiter.reset_stats();
@@ -222,7 +222,7 @@ TEST_F(ArbiterTest, ConcurrentTasksNeverOverlapOnTheBus) {
 
       // Two tasks model the real load: the sensor on its own device, the display on
       // the other, both sharing the bus.
-      const uint16_t addr = (t % 2 == 0) ? kAddrSht31 : kAddrSsd1306;
+      const uint16_t addr = (t % 2 == 0) ? kAddrAht20 : kAddrSsd1306;
       for (int i = 0; i < kTransfersPerThread; ++i) {
         uint8_t payload = static_cast<uint8_t>(i);
         if (arbiter.write(addr, &payload, 1) != BusResult::Ok) {
@@ -264,7 +264,7 @@ TEST_F(ArbiterTest, InvalidArbiterWithoutAMutexFailsCleanly) {
   I2cArbiter broken(bus.iface(), &bare, &recovery);
 
   EXPECT_FALSE(broken.valid());
-  EXPECT_EQ(broken.write(kAddrSht31, nullptr, 0), BusResult::Unavailable);
+  EXPECT_EQ(broken.write(kAddrAht20, nullptr, 0), BusResult::Unavailable);
   EXPECT_EQ(bus.transfer_calls(), 0);
 }
 

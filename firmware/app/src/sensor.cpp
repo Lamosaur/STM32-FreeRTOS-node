@@ -3,25 +3,60 @@
 namespace node {
 namespace {
 
-// SHT3x command words, most significant byte first (datasheet section 4).
-constexpr uint8_t kCmdMeasureHighNoStretch = 0x24;
-constexpr uint8_t kCmdMeasureHighNoStretchArg = 0x00;
-constexpr uint8_t kCmdSoftReset = 0x30;
-constexpr uint8_t kCmdSoftResetArg = 0xA2;
+// AHT20 command bytes, in the order they go on the wire.
+//
+//   initialize  0xBE 0x08 0x00 — calibrate. (The AHT10 and the shared Adafruit-family
+//               drivers send 0xE1 0x08 0x00 instead; see the header for why this follows
+//               the AHT20 datasheet.)
+//   measure     0xAC 0x33 0x00 — trigger a temperature + humidity conversion.
+constexpr uint8_t kCmdInitialize = 0xBE;
+constexpr uint8_t kCmdInitializeArg = 0x08;
+constexpr uint8_t kCmdTrigger = 0xAC;
+constexpr uint8_t kCmdTriggerArg = 0x33;
+constexpr uint8_t kCmdNop = 0x00;
 
-// A measurement result is two 16-bit words, each followed by its own CRC: 6 bytes.
-constexpr size_t kMeasurementBytes = 6;
+// Status byte bits.
+constexpr uint8_t kStatusBusy = 0x80;
+constexpr uint8_t kStatusCalibrated = 0x08;
 
-// Datasheet full-scale spans. Temperature is -45..+130 C, humidity 0..100 %RH, both
-// linear in the 16-bit raw value.
-constexpr int32_t kTemperatureOffsetMilli = -45'000;
-constexpr int32_t kTemperatureSpanMilli = 175'000;
-constexpr int32_t kHumiditySpanMilliRh = 100'000;
-constexpr int32_t kRawFullScale = 65'535;
+// One frame is 7 bytes: a status byte, five data bytes, and a CRC over the first six.
+//
+// This is NOT the SHT3x layout that the previous driver read (two 16-bit words, each with
+// its own CRC byte). The AHT20 packs 20 bits of humidity and 20 bits of temperature into
+// the five data bytes and appends a single CRC for the whole frame:
+//
+//   [0] status
+//   [1] humidity[19:12]
+//   [2] humidity[11:4]
+//   [3] humidity[3:0] << 4 | temperature[19:16]
+//   [4] temperature[15:8]
+//   [5] temperature[7:0]
+//   [6] CRC-8 over bytes 0..5
+//
+// A driver that kept the SHT3x framing would read zero humidity and a CRC mismatch on
+// every frame — which fails loudly rather than quietly, and is the reason this comment
+// quotes the datasheet's layout rather than paraphrasing it.
+constexpr size_t kFrameBytes = 7;
+constexpr size_t kCrcCoveredBytes = 6;
+
+// The 20-bit full scale of both quantities, and the spans the datasheet's formulas use.
+constexpr int64_t kRawFullScale = 1'048'576; // 2^20
+constexpr int64_t kTemperatureOffsetMilli = -50'000;
+constexpr int64_t kTemperatureSpanMilli = 200'000;
+constexpr int64_t kHumiditySpanMilliRh = 100'000;
+constexpr int64_t kHumidityMaxMilliRh = 100'000;
+
+// The calibration handshake: a settling wait after the command, then a bounded poll of
+// the status byte. Ten attempts at 2 ms is 20 ms of polling, comfortably past the "few
+// milliseconds" the device needs to calibrate; what the bound is for is the device that
+// never goes idle, which without it would hang SensorService::init() and with it the boot.
+constexpr uint32_t kCalibrationDelayMs = 10;
+constexpr uint32_t kCalibrationPollDelayMs = 2;
+constexpr int kCalibrationPollAttempts = 10;
 
 } // namespace
 
-uint8_t Sht31::crc8(const uint8_t *data, size_t len) {
+uint8_t Aht20::crc8(const uint8_t *data, size_t len) {
   uint8_t crc = 0xFF;
   for (size_t i = 0; i < len; ++i) {
     crc ^= data[i];
@@ -38,33 +73,61 @@ uint8_t Sht31::crc8(const uint8_t *data, size_t len) {
   return crc;
 }
 
-int32_t Sht31::raw_to_milli_celsius(uint16_t raw) {
-  // The intermediate product overflows 32 bits (175000 * 65535 is about 1.15e10), so
-  // the multiply is done in 64 bits. It happens once per second, so the cost is
-  // irrelevant next to the correctness of not silently wrapping.
-  const int64_t product = static_cast<int64_t>(kTemperatureSpanMilli) * raw;
-  return kTemperatureOffsetMilli + static_cast<int32_t>(product / kRawFullScale);
+bool Aht20::busy(uint8_t status) { return (status & kStatusBusy) != 0U; }
+
+bool Aht20::calibrated(uint8_t status) { return (status & kStatusCalibrated) != 0U; }
+
+int32_t Aht20::raw_to_milli_celsius(uint32_t raw) {
+  // The datasheet's formula, in integers: raw / 2^20 * 200 - 50, scaled to milli-degrees.
+  // The product is taken in 64 bits because 200000 * 1048575 is about 2.1e11.
+  const int64_t product = kTemperatureSpanMilli * static_cast<int64_t>(raw);
+  return static_cast<int32_t>(kTemperatureOffsetMilli + (product / kRawFullScale));
 }
 
-int32_t Sht31::raw_to_milli_rh(uint16_t raw) {
-  const int64_t product = static_cast<int64_t>(kHumiditySpanMilliRh) * raw;
-  const int32_t milli_rh = static_cast<int32_t>(product / kRawFullScale);
-  // The datasheet's humidity range is 0..100 %RH, so an out-of-range result would mean
-  // the raw word was corrupt despite passing CRC. Clamp rather than report a value the
-  // sensor cannot produce.
+int32_t Aht20::raw_to_milli_rh(uint32_t raw) {
+  const int64_t product = kHumiditySpanMilliRh * static_cast<int64_t>(raw);
+  const int64_t milli_rh = product / kRawFullScale;
+  // The datasheet's humidity range is 0..100 %RH, so a result outside it would mean the
+  // raw field was corrupt despite passing CRC. Clamped rather than reported, for the same
+  // reason the previous driver clamped: a number the sensor cannot produce is not a
+  // measurement, and reporting it invites a control loop to act on it.
   if (milli_rh < 0) {
     return 0;
   }
-  if (milli_rh > kHumiditySpanMilliRh) {
-    return kHumiditySpanMilliRh;
+  if (milli_rh > kHumidityMaxMilliRh) {
+    return static_cast<int32_t>(kHumidityMaxMilliRh);
   }
-  return milli_rh;
+  return static_cast<int32_t>(milli_rh);
 }
 
-Sht31::Sht31(I2cArbiter *bus, uint16_t addr7) : bus_(bus), addr7_(addr7) {}
+Aht20::Aht20(I2cArbiter *bus, uint16_t addr7) : bus_(bus), addr7_(addr7) {}
 
-bool Sht31::reset() {
-  const uint8_t command[2] = {kCmdSoftReset, kCmdSoftResetArg};
+bool Aht20::status_byte(uint8_t *out) {
+  if (out == nullptr) {
+    return false;
+  }
+
+  uint8_t status = 0;
+  if (bus_->read(addr7_, &status, 1) != BusResult::Ok) {
+    stats_.bus_errors++;
+    return false;
+  }
+  *out = status;
+  return true;
+}
+
+bool Aht20::begin_calibration() {
+  const uint8_t command[3] = {kCmdInitialize, kCmdInitializeArg, kCmdNop};
+  if (bus_->write(addr7_, command, sizeof(command)) != BusResult::Ok) {
+    stats_.bus_errors++;
+    return false;
+  }
+  stats_.calibrations++;
+  return true;
+}
+
+bool Aht20::trigger() {
+  const uint8_t command[3] = {kCmdTrigger, kCmdTriggerArg, kCmdNop};
   const bool ok = bus_->write(addr7_, command, sizeof(command)) == BusResult::Ok;
   if (!ok) {
     stats_.bus_errors++;
@@ -72,37 +135,44 @@ bool Sht31::reset() {
   return ok;
 }
 
-bool Sht31::trigger() {
-  const uint8_t command[2] = {kCmdMeasureHighNoStretch, kCmdMeasureHighNoStretchArg};
-  const bool ok = bus_->write(addr7_, command, sizeof(command)) == BusResult::Ok;
-  if (!ok) {
-    stats_.bus_errors++;
-  }
-  return ok;
-}
+bool Aht20::read(Aht20Reading *out) {
+  Aht20Reading reading{};
 
-bool Sht31::read(Sht31Reading *out) {
-  Sht31Reading reading{};
-
-  uint8_t raw[kMeasurementBytes] = {0};
+  uint8_t raw[kFrameBytes] = {0};
   if (bus_->read(addr7_, raw, sizeof(raw)) != BusResult::Ok) {
     stats_.bus_errors++;
     *out = reading;
     return false;
   }
 
-  // Each 16-bit word carries its own CRC byte, so a single corrupted byte in either
-  // word is caught rather than propagating into the converted value.
-  if (crc8(&raw[0], 2) != raw[2] || crc8(&raw[3], 2) != raw[5]) {
+  // One CRC over the status byte and the five data bytes. Checking the whole frame rather
+  // than only the data means corruption in the status byte is caught too, and the status
+  // byte is not decoration: it carries the busy and calibrated bits the conversion below
+  // relies on.
+  if (crc8(raw, kCrcCoveredBytes) != raw[kCrcCoveredBytes]) {
     stats_.crc_errors++;
     *out = reading;
     return false;
   }
 
-  reading.raw_temperature = static_cast<uint16_t>((static_cast<uint16_t>(raw[0]) << 8) |
-                                                 raw[1]);
-  reading.raw_humidity = static_cast<uint16_t>((static_cast<uint16_t>(raw[3]) << 8) |
-                                               raw[4]);
+  reading.status = raw[0];
+  if (busy(reading.status)) {
+    // A frame that arrived while the device says it is still converting is not a
+    // measurement. Counted separately from a CRC error because the causes are different:
+    // a CRC error is a bus or timing fault, this is a caller that read too early — and the
+    // two want different fixes.
+    stats_.short_reads++;
+    *out = reading;
+    return false;
+  }
+
+  reading.raw_humidity = ((static_cast<uint32_t>(raw[1]) << 12) |
+                          (static_cast<uint32_t>(raw[2]) << 4) |
+                          (static_cast<uint32_t>(raw[3]) >> 4));
+  reading.raw_temperature = ((static_cast<uint32_t>(raw[3] & 0x0FU) << 16) |
+                             (static_cast<uint32_t>(raw[4]) << 8) |
+                             static_cast<uint32_t>(raw[5]));
+
   reading.temperature_milli_c = raw_to_milli_celsius(reading.raw_temperature);
   reading.humidity_milli_rh = raw_to_milli_rh(reading.raw_humidity);
   reading.valid = true;
@@ -125,12 +195,43 @@ SensorService::SensorService(I2cArbiter *bus, const rtos_iface_t *rtos, uint16_t
 }
 
 bool SensorService::init() {
-  if (!driver_.reset()) {
+  // The bring-up handshake, in three parts, with the waiting done here rather than in the
+  // driver so that the driver stays free of any clock:
+  //
+  //   1. the calibration command,
+  //   2. a settling wait — the device needs a few milliseconds before it will answer,
+  //   3. a bounded poll of the status byte until it reports itself idle.
+  if (!driver_.begin_calibration()) {
     return false;
   }
-  // The soft reset needs a moment before the device accepts a command.
-  rtos_->delay_ms(rtos_->ctx, 2);
-  return true;
+  rtos_->delay_ms(rtos_->ctx, kCalibrationDelayMs);
+
+  bool saw_calibrated = false;
+  for (int attempt = 0; attempt < kCalibrationPollAttempts; ++attempt) {
+    uint8_t status = 0;
+    if (!driver_.status_byte(&status)) {
+      // A read that failed is not the same as a device that is busy: the bus is the
+      // problem, and retrying the same read is what the arbiter already does. Counted by
+      // the driver as a bus error and retried here until the budget runs out.
+      rtos_->delay_ms(rtos_->ctx, kCalibrationPollDelayMs);
+      continue;
+    }
+
+    saw_calibrated = saw_calibrated || Aht20::calibrated(status);
+    if (!Aht20::busy(status)) {
+      if (!saw_calibrated) {
+        // Idle but never once calibrated: allowed to proceed (see the header), recorded so
+        // that a bench session can see it rather than having to infer it.
+        driver_.note_uncalibrated();
+      }
+      return true;
+    }
+    rtos_->delay_ms(rtos_->ctx, kCalibrationPollDelayMs);
+  }
+
+  // Never went idle inside the budget. Reported as a failed init so the caller treats the
+  // sensor as absent rather than as one whose readings are merely late.
+  return false;
 }
 
 bool SensorService::update() {
@@ -145,7 +246,7 @@ bool SensorService::update() {
   // The bus is free for the other tasks here; see the comment on update() in the header.
   rtos_->delay_ms(rtos_->ctx, conversion_ms_);
 
-  Sht31Reading reading{};
+  Aht20Reading reading{};
   if (!driver_.read(&reading) || !reading.valid) {
     stats_.failed++;
     note_failure();
