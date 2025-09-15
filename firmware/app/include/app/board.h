@@ -40,13 +40,26 @@ constexpr uint32_t kI2cBusHz = 400'000;
 constexpr uint32_t kI2cTransferTimeoutMs = 20;
 
 // 7-bit device addresses.
-constexpr uint16_t kAddrSht31 = 0x44;   // temperature + humidity (sensor task)
+//
+// The ambient sensor is an "AHT20 + BMP280" combo module: two dies, one carrier, so two
+// addresses on the same bus. Only the AHT20 is read. The BMP280 is deliberately NOT
+// driven — it answers the bring-up bus scan at 0x76 (0x77 when SDO is strapped high,
+// which the module's pull-down normally decides) and nothing in this firmware talks to
+// it, because pressure is not on any requirement path and Bosch's compensation routine
+// is a sizeable piece of work that would compete with Phase 2 for time. If a later phase
+// wants pressure, that is a new driver against this address, not a change to the AHT20
+// one.
+constexpr uint16_t kAddrAht20 = 0x38;   // temperature + humidity (sensor task)
+constexpr uint16_t kAddrBmp280 = 0x76;  // present on the bus, deliberately unread
 constexpr uint16_t kAddrSsd1306 = 0x3C; // 128x64 OLED (display task)
 
-// SHT31 single-measurement conversion time, high repeatability. The datasheet's
-// worst case is 15.5 ms; 20 gives margin without meaningfully changing the 1 s poll
-// period. The bus is released for this whole window, not held.
-constexpr uint32_t kSht31ConversionMs = 20;
+// AHT20 measurement time. The datasheet's maximum is 80 ms, and unlike the SHT3x there is
+// no "low repeatability" mode to trade accuracy for speed, so the wait is the datasheet's
+// number with no margin to shave: the alternative is to poll the status byte's busy bit
+// (see Aht20::busy), which the driver exposes but SensorService does not need, because the
+// sensor task's period (1000 ms) is twelve times this wait and the bus is released for the
+// whole of it either way.
+constexpr uint32_t kAht20ConversionMs = 80;
 
 // ---------------------------------------------------------------------------
 // I2C bus recovery (FR-0.3)
@@ -121,18 +134,38 @@ struct TaskSpec {
   uint32_t period_ms;
 };
 
+// The app task's period, and the reason it is 25 ms rather than the 100 ms Phase 0 ran at.
+//
+// Phase 1 puts the actuator gate inside this task: the window decides on and off, and the
+// task samples that decision. The sampling interval is therefore the resolution of the
+// gate's edge, and the number it has to be good against is kControlMinOnTimeMs — the
+// shortest pulse the loop is willing to deliver. 25 ms means the shortest pulse the loop
+// can command (50 ms) is at least two task periods long, so its on-edge and its off-edge
+// each land on a tick of their own and the pulse cannot be swallowed between two samples.
+// Any period at or above the minimum on-time breaks that: at 50 ms a legal 50 ms pulse
+// would be a coin flip between being delivered and being missed entirely, and the control
+// loop's authority would depend on the phase of the scheduler.
+//
+// The cost is scheduling: the app task wakes 40 times a second instead of 10. It is the
+// cheapest task in the image (a comparison, a window evaluation and at most one GPIO
+// write per tick) and the control evaluation itself is not tied to this period — see the
+// control-period note in the acquisition section below — so the extra wake-ups buy edge
+// resolution and nothing else.
+//
+// The sensor task keeps its 1000 ms period. It is not the acquisition consumer, for the
+// reason recorded with kAcquisitionDrainPeriodMs: it blocks in the AHT20's 80 ms
+// conversion, so a drain on its tick would be paced by an I2C transfer rather than by the
+// block rate.
+constexpr uint32_t kAppTaskPeriodMs = 25;
+
 // Stack sizes are in words, as FreeRTOS counts them (4 bytes). Provisional: NFR-1.11
 // requires these to be right-sized from uxTaskGetStackHighWaterMark() with 25 % headroom
 // kept, and the F103C8T6 has only 20 KB of RAM, so raising one is a real budget decision
 // rather than a free change.
-//
-// Periods: Phase 0 carries no control loop (that is Phase 1), so the app task's period is
-// the one that will become the control period, which keeps the scheduling measurements
-// taken here comparable to Phase 1's.
 constexpr TaskSpec kTaskSpecs[kTaskCount] = {
     {TaskId::Supervisor, "supervisor", 4, 192, 250},
     {TaskId::Sensor, "sensor", 3, 320, 1000},
-    {TaskId::App, "app", 3, 320, 100},
+    {TaskId::App, "app", 3, 320, kAppTaskPeriodMs},
     {TaskId::Comms, "comms", 2, 384, 50},
     {TaskId::Display, "display", 1, 384, 200},
 };
@@ -194,6 +227,59 @@ constexpr uint32_t kAdcPublishRateHz =
 constexpr uint32_t kAfeResistorOhms = 10'000;
 constexpr uint32_t kAfeCapacitorPicoFarads = 150'000;  // 150 nF
 constexpr uint32_t kAfeCornerMilliHz = 106'100;
+
+// ---------------------------------------------------------------------------
+// Phase 1 — the ADC configuration (FR-1.1) and where the values live
+// ---------------------------------------------------------------------------
+// The peripheral numbers behind kAdcSampleRateHz, worked out here rather than left to
+// the HAL file, because they are a consequence of the clock tree and the source
+// impedance rather than of any one driver, and because someone changing the sample rate
+// has to see them.
+//
+//   ADCCLK          PCLK2 / 6 = 72 MHz / 6 = 12 MHz. The datasheet's ceiling is 14 MHz,
+//                   and 12 MHz is what the F103's 72 MHz tree gives with the largest
+//                   permissible divider. RCC_ADCPCLK2_DIV6.
+//   Sampling time   71.5 ADCCLK cycles.
+//   Conversion      71.5 + 12.5 = 84 ADCCLK cycles for 12 bits = 7.0 us at 12 MHz.
+//   Ceiling         1 / 7.0 us = 142.8 kSPS with this sampling time. (With the shortest
+//                   sample time the same ADC reaches ~600 kSPS, which is the figure
+//                   hal/adc.h quotes; the difference is entirely the sampling time, and
+//                   the sampling time is set by the source, see below.)
+//   Requested       1 kHz, which is 143x below the ceiling — the point of oversampling is
+//                   the average, not the rate.
+//
+// Why 71.5 cycles for a ~10 kohm source, as arithmetic rather than as a habit. The
+// sample-and-hold capacitor is 8 pF and the internal switch resistance is at most 1 kohm
+// (datasheet), so a 10 kohm source presents 11 kohm, and the capacitor has to settle to
+// better than half an LSB of a 12-bit conversion:
+//
+//   t_sample >= (R_ADC + R_AIN) x C_ADC x ln(2^(n+2))
+//             = 11 kohm x 8 pF x ln(2^14)
+//             = 88 ns x 9.704
+//             = 854 ns
+//
+// 71.5 cycles at 12 MHz is 5.96 us, seven times that. The shortest setting (1.5 cycles =
+// 125 ns) misses by 7x the other way, and 7.5 cycles (625 ns) is still short: with the RC
+// of the anti-alias filter (10 kohm, 150 nF) the filter's capacitor supplies the sample
+// charge rather than the resistor, but assuming the resistor alone is the conservative
+// case and it is the case that has to hold before the AFE exists — "straight to the pin
+// for first light", with a probe whose output impedance is not specified.
+//
+// The 150 nF of that RC recovers between samples by exp(-100 us / 1.5 ms), i.e. it is
+// back to within 7 % of any droop long before the next conversion; the droop itself is
+// 8 pF / 150 nF = 0.005 % of the sample voltage.
+constexpr uint32_t kAdcClockHz = 12'000'000;      // PCLK2 / 6
+constexpr uint32_t kAdcSampleTimeCycles = 71;     // 71.5 rounded down, see the ADC HAL
+constexpr uint32_t kAdcConversionCycles = 84;     // 71.5 sample + 12.5 successive approx.
+constexpr uint32_t kAdcConversionMicros = 7;      // 84 cycles at 12 MHz, rounded up
+
+// One DMA half-buffer: the block period and the rate at which a value is published.
+constexpr uint32_t kAdcBlockPeriodMs =
+    (static_cast<uint32_t>(kAdcBlockSamples) * 1'000U) / kAdcSampleRateHz;  // 100 ms
+static_assert(static_cast<uint32_t>(kAdcBlockSamples) * 1'000U ==
+                  kAdcBlockPeriodMs * kAdcSampleRateHz,
+              "the block period must be exact, or a block is not a whole number of ms");
+
 
 // Completed blocks awaiting averaging. Two is the minimum that survives one late consumer;
 // each extra slot costs kAdcBlockSamples * 2 bytes (200 here) and only helps if the
@@ -307,6 +393,66 @@ constexpr uint32_t kTimingMaxValueUs = 2'000'000;
 // time-proportioned rather than PWM: the window is the period.
 constexpr uint32_t kControlPeriodMs = 1'000;
 
+// ---------------------------------------------------------------------------
+// Phase 1 — how often the completed blocks are collected, and what the control
+// period is counted in
+// ---------------------------------------------------------------------------
+// Both of these live here, after kControlPeriodMs and kAdcBlockRingCapacity, because both
+// are statements about the relationship between the block rate and the control period and
+// neither can be read without those two numbers.
+//
+// THE DRAIN CADENCE. The consumer of the DMA blocks is the app task, every
+// kAcquisitionDrainEveryAppTicks of its 25 ms ticks. Both bounds on that period are hard,
+// and they are why the cadence is stated here rather than left to whichever task happens
+// to call update():
+//
+//   * SLOWER than the block period, or the drain finds nothing. An empty drain is not a
+//     no-op: AcquisitionService records it as a failed publish cycle — an empty update
+//     means the producer has stopped, which is the whole staleness mechanism — so a
+//     consumer that polls faster than the producer manufactures "stale" readings, and the
+//     control loop's fail-safe (decision 8) turns each one into a skipped window. This is
+//     the constraint that rules out draining from a fast tick.
+//   * FASTER than the ring can absorb: kAdcBlockRingCapacity blocks of margin, so a drain
+//     window that spans more than kAdcBlockRingCapacity + 1 blocks loses the oldest. 150 ms
+//     against a 200 ms budget means a window holds one or two completed blocks and both are
+//     published, so nothing is dropped in the steady state — over a second, ten drains and
+//     ten blocks, which is the 10 Hz the block size and rate were chosen for. The margin is
+//     also what absorbs a window that runs late: it takes a 200 ms delay before the third
+//     block arrives and the overrun counter starts moving. A drain window of exactly one
+//     block period would instead sit on the block boundary and lose the race with the DMA
+//     interrupt about as often as it won it.
+//
+// Why not the sensor task, which is where the other input is read: SensorService::update()
+// blocks for the AHT20's 80 ms conversion, so a drain on that tick would be paced by an
+// I2C transfer (150 + 80 = 230 ms, past the 200 ms the ring absorbs) and the acquisition's
+// cadence would depend on how long a humidity reading took. The app task does no I2C, so
+// its tick is the one place in the image where a period is what the table says it is.
+//
+// THE CONTROL PERIOD. design-spec.md §6: "Control period is set by a hardware timer, not
+// vTaskDelay, so period accuracy does not depend on tick granularity." The loop is
+// therefore evaluated when the acquisition's own block numbering crosses a boundary, never
+// on a delay:
+//
+//   10 blocks x 100 samples / 1000 Hz = 1 s, exactly.
+//
+// Those blocks are numbered by the DMA half/full-transfer interrupts that TIM2's TRGO
+// produces, so the count is hardware time: a control period is ten hardware-timed blocks
+// whether the scheduler ran the app task 39 times inside it or 41, and the integral's dt
+// is derived from the same quantity. The app task's 25 ms period then decides only *when
+// inside that second* the crossing is noticed, which is the scheduling quantity NFR-1.8
+// measures and the trace pin marks — not the control period itself.
+constexpr uint32_t kAcquisitionDrainEveryAppTicks = 6;
+constexpr uint32_t kAcquisitionDrainPeriodMs = kAppTaskPeriodMs * kAcquisitionDrainEveryAppTicks;
+static_assert(kAcquisitionDrainPeriodMs > kAdcBlockPeriodMs,
+              "draining faster than the producer records false stale cycles");
+static_assert(kAcquisitionDrainPeriodMs <=
+                  static_cast<uint32_t>(kAdcBlockRingCapacity) * kAdcBlockPeriodMs,
+              "a drain window longer than the ring loses the oldest blocks");
+
+constexpr uint32_t kAdcBlocksPerControlPeriod = kControlPeriodMs / kAdcBlockPeriodMs;  // 10
+static_assert(kAdcBlocksPerControlPeriod * kAdcBlockPeriodMs == kControlPeriodMs,
+              "the control period must be a whole number of acquisition blocks");
+
 constexpr int32_t kControlSetpointPermille = 450;
 
 // A window whose computed on-time is nonzero but shorter than this is skipped entirely
@@ -321,6 +467,48 @@ constexpr uint32_t kControlMinOnTimeMs = 50;
 // Half the window. The cap is what keeps a saturated controller from holding the pump on
 // for the whole period, and it is also what bounds the integral's authority below.
 constexpr int32_t kControlMaxDutyPermille = 500;
+
+// ---------------------------------------------------------------------------
+// Phase 1 — the board pins the analog channel and the actuator use
+// ---------------------------------------------------------------------------
+// These three are NOT ids in hal_gpio_iface_t, and that is deliberate. They are not
+// general-purpose pins a task drives: PA0 belongs to ADC1, PA1 to the one output the
+// fail-safe owns, and PA2 is reserved, so exposing them as gpio ids would invite an
+// application task to write to the probe input or to the gate behind the control loop's
+// back — which is the one thing the actuator interface exists to make impossible. They
+// are therefore facts about the board, stated here for the reviewer, and the mapping to
+// port and bit lives in the HAL files that own the peripherals
+// (hal/stm32f1/hal_adc_stm32f1.c, hal/stm32f1/hal_actuator_stm32f1.c) with
+// hal_stm32f1.h's hardware assignment as the reference.
+//
+//   | Function                | Pin | Note                                              |
+//   |-------------------------|-----|---------------------------------------------------|
+//   | Analog in from probe    | PA0 | ADC1_IN0. Through the AFE buffer + RC when that   |
+//   |                         |     | exists (FR-1.2, FR-3.10); straight to the pin for  |
+//   |                         |     | first light, which is why the sampling time is     |
+//   |                         |     | sized for a ~10 kohm source.                       |
+//   | Actuator gate           | PA1 | Low-side MOSFET gate, push-pull output, driven     |
+//   |                         |     | only through hal/actuator.h. Needs the external    |
+//   |                         |     | pull-down documented in that header.               |
+//   | Probe power gate        | PA2 | RESERVED, NOT DRIVEN. Not needed for corrosion —   |
+//   |                         |     | a capacitive probe does not electrolyse, so        |
+//   |                         |     | continuous power is electrically fine — but the    |
+//   |                         |     | probe draws about 5 mA continuously, which is the  |
+//   |                         |     | largest single item in Phase 4's budget. PA2 is    |
+//   |                         |     | left unallocated here so that duty-cycling the     |
+//   |                         |     | probe is a Phase 4 change to one pin and not a     |
+//   |                         |     | re-layout; nothing in this firmware configures it. |
+//
+// Already taken, and so unavailable for any of the above: PC13 (status LED), PB0/PB1/PB5
+// (trace pins), PB6/PB7 (I2C1), PA9/PA10 (USART1), PA13/PA14 (SWD).
+//
+// The numbers below are port bits on GPIOA, numbered from 0 as the reference manual
+// numbers them. They are named rather than written as literals so that the HAL files and
+// the comments above can be read against each other, and the prefix is deliberately
+// different from kPin* to keep them from being mistaken for gpio ids.
+constexpr uint32_t kProbeAnalogPortBit = 0;  // PA0, ADC1_IN0
+constexpr uint32_t kActuatorGatePortBit = 1; // PA1, low-side MOSFET gate
+constexpr uint32_t kProbePowerPortBit = 2;   // PA2, reserved — see the table above
 
 // PID gains, in the fixed-point convention the loop's arithmetic uses (there is no float
 // anywhere in this firmware: the F103 has no FPU, so a float would mean soft-float

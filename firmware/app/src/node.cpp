@@ -26,10 +26,18 @@ Node::Node(const NodeHardware &hardware)
       arbiter_(hw_.i2c, hw_.rtos, &recovery_),
       supervisor_(hw_.rtos, hw_.watchdog),
       sensor_(&arbiter_, hw_.rtos),
+      acquisition_(adc_stamp_.iface(), hw_.rtos),
+      control_(&tuning_),
       display_{&arbiter_},
       comms_(hw_.uart, &arbiter_, hw_.rtos,
              CommsSources{&sensor_, &supervisor_, &arbiter_, hw_.system,
-                          &display_.stats(), &identity_}) {}
+                          &display_.stats(), &identity_, &tuning_, &acquisition_, &control_}) {
+  // The ISR-side stamping wrapper is bound here, in the constructor, rather than in init():
+  // the acquisition service was handed `adc_stamp_.iface()` in the member-initialiser list
+  // above, so the forwardee has to be in place before anything can call start(). A null
+  // `hw_.adc` is handled by the wrapper's own null check and by AcquisitionService's.
+  adc_stamp_.bind(hw_.adc, hw_.clock, hw_.gpio);
+}
 
 bool Node::init() {
   if (hw_.i2c == nullptr || hw_.rtos == nullptr) {
@@ -48,6 +56,22 @@ bool Node::init() {
     hw_.gpio->configure_output(hw_.gpio->ctx, kPinTraceTask, HAL_GPIO_OUT_PUSH_PULL);
   }
 
+  // The actuator comes up before anything that could ask it to run, and its init() leaves
+  // the gate off. Order relative to the arbiter: the gate needs no bus and no lock, so it
+  // is the one output that can be put into its fail-safe state before any service that
+  // might fail is even started — which is the order in which a fault after this point
+  // leaves the pump stopped.
+  if (hw_.actuator != nullptr && hw_.actuator->init != nullptr) {
+    if (!hw_.actuator->init(hw_.actuator->ctx)) {
+      // A gate that could not be brought up safely is treated as absent rather than as
+      // stopped-and-forgotten: hal/actuator.h is explicit that a failed init() is a reason
+      // to withhold control entirely, because a gate driven through an unconfigured pin
+      // may sit high. Dropping the handle means the control loop still evaluates and its
+      // decisions are still visible, but nothing energises a pin this code does not own.
+      hw_.actuator = nullptr;
+    }
+  }
+
   // The panel comes up before anything that might fail, so that a later failure can be
   // shown on the node rather than only on a host that may not be attached.
   display_ready_ = display_.init();
@@ -56,6 +80,14 @@ bool Node::init() {
   // reading; it is not a reason to refuse to boot, because a node that cannot display
   // its own fault is less useful than one that boots and complains.
   sensor_.init();
+
+  // The analog channel (FR-1.1). Started here, in the task context that is about to be
+  // superseded by the five tasks, because hal/adc.h offers no way to ask whether it is
+  // running and no way to start it late without risking the control loop acting on a
+  // period it never measured. A refusal is recorded by the service (start_failures) and
+  // leaves the fix in place: the fail-safe holds the gate off until readings arrive, so an
+  // absent ADC stops the pump instead of letting the loop decide on nothing.
+  acquisition_.start();
 
   if (hw_.watchdog != nullptr) {
     hw_.watchdog->start(hw_.watchdog->ctx, kWatchdogTimeoutMs);
@@ -158,34 +190,209 @@ void Node::tick_sensor() { sensor_.update(); }
 void Node::tick_display() { render_status(); }
 
 void Node::tick_app() {
-  // The marker for the NFR-1.8 jitter measurement; Phase 1 toggles this around the
-  // control loop instead of around this classification.
-  if (hw_.gpio != nullptr) {
-    hw_.gpio->toggle(hw_.gpio->ctx, kPinTraceControl);
-  }
-
+  // The Phase 0 classification of the I2C humidity reading stays exactly as it was: it is
+  // what the panel shows and what the telemetry line reports, and it is deliberately not
+  // what the control loop acts on (decision 1 of the Phase 1 record makes soil moisture the
+  // controlled variable).
   app_.evaluations++;
 
-  const SensorSnapshot snap = sensor_.snapshot();
-  app_.last_reading = snap;
+  const SensorSnapshot ambient = sensor_.snapshot();
+  app_.last_reading = ambient;
 
   // fresh(), not reading.valid: valid only means a reading once arrived, and the service
   // deliberately keeps the last good value after a failure, so checking valid() here
   // would have the app classifying a frozen number indefinitely.
-  if (!snap.fresh()) {
+  if (!ambient.fresh()) {
     // Refuse to act on a reading that is absent or no longer being refreshed. Keeping
     // the previous state is deliberately the conservative choice: a silent sensor is not
     // evidence that conditions changed.
     app_.rejected_readings++;
-    return;
-  }
-
-  if (snap.reading.humidity_milli_rh < kPlantDryMilliRh) {
+  } else if (ambient.reading.humidity_milli_rh < kPlantDryMilliRh) {
     app_.plant = PlantState::Dry;
-  } else if (snap.reading.humidity_milli_rh > kPlantWetMilliRh) {
+  } else if (ambient.reading.humidity_milli_rh > kPlantWetMilliRh) {
     app_.plant = PlantState::Wet;
   } else {
     app_.plant = PlantState::Ok;
+  }
+
+  // Phase 1, in three parts, and the order is the design:
+  //
+  //   1. drain the acquisition ring if this tick is a drain tick, so the snapshot read
+  //      below is the freshest one available rather than one up to kAcquisitionDrainPeriodMs
+  //      old;
+  //   2. evaluate the control loop if the acquisition's own block numbering has crossed a
+  //      control-period boundary — never on a task delay (design-spec.md §6);
+  //   3. drive the gate, every tick, because the gate's edge resolution is this task's
+  //      period and the window's on-time may expire between two control evaluations.
+  const uint32_t now_ms = hw_.rtos->now_ms(hw_.rtos->ctx);
+  const uint32_t us = now_us();
+
+  drain_acquisition();
+
+  // One snapshot per tick, taken once and used by both the NFR-1.9 measurement and the
+  // control decision. Taking it twice would allow the two to describe different readings,
+  // which is precisely the incoherence the tuning store's snapshot scheme avoids.
+  const AnalogSnapshot snapshot = acquisition_.snapshot();
+
+  // NFR-1.9's task-side edge: the ISR judged a block, and this is the first task entry that
+  // can see it. The latency recorded is therefore "interrupt to the task that observes it",
+  // which is what the logic analyzer capture of kPinTraceIsr -> kPinTraceTask shows. It is
+  // not "interrupt to the consumer": the block is consumed at the next drain tick, up to
+  // kAcquisitionDrainPeriodMs later, and that delay is the polling cadence's, not the
+  // RTOS's. Both numbers are worth having and they are deliberately not added together —
+  // the second is a design property, the first is what NFR-1.9 asks for.
+  const uint32_t stamped = adc_stamp_.stamped_blocks();
+  if (stamped != last_stamped_blocks_) {
+    last_stamped_blocks_ = stamped;
+    if (hw_.gpio != nullptr) {
+      hw_.gpio->toggle(hw_.gpio->ctx, kPinTraceTask);
+    }
+    if (hw_.clock != nullptr) {
+      // Unsigned subtraction, so a wrap of the microsecond counter between the stamp and
+      // this tick reads as a huge interval rather than a small one. The counter wraps every
+      // 71.6 minutes and the interval here is a task period, so a wrap in between is
+      // possible at most once in 71 minutes and is counted in the series' oversized
+      // samples rather than folded into the mean as if it were a real latency.
+      timing_.note_latency_us(us - adc_stamp_.last_stamp_us());
+      note_timing_window();
+    }
+  }
+
+  // The control period, counted in blocks rather than in ticks. `block_index` is the
+  // producer's own numbering of the block the published value came from, and those blocks
+  // are the ones TIM3's TRGO produced, so the group index changes once every
+  // kAdcBlocksPerControlPeriod blocks of *hardware* time. A tick that is late, early, or
+  // skipped therefore does not move the period: it only decides when inside the second the
+  // crossing is noticed.
+  if (snapshot.valid) {
+    const uint32_t group = snapshot.block_index / kAdcBlocksPerControlPeriod;
+    if (!have_control_group_) {
+      // The first value to arrive starts the loop. Not "group 0 evaluates immediately":
+      // block indices below ten would then evaluate on the first tick after start-up with a
+      // partial period behind them, and the integral would integrate over it.
+      have_control_group_ = true;
+      control_block_group_ = group;
+      recompute_control(now_ms, us, snapshot);
+    } else if (group != control_block_group_) {
+      // A jump of more than one group means the control task missed whole periods (a stall,
+      // or an acquisition overrun). Each skipped group is counted rather than evaluated:
+      // running the PID once per missed group would integrate an interval the loop never
+      // saw the plant over, and the sample-time-aware dt already accounts for the elapsed
+      // time exactly once.
+      stats_.control_skipped_periods += (group - control_block_group_) - 1U;
+      control_block_group_ = group;
+      recompute_control(now_ms, us, snapshot);
+    }
+  }
+
+  apply_gate(now_ms, snapshot);
+}
+
+void Node::drain_acquisition() {
+  app_ticks_++;
+
+  // kAcquisitionDrainEveryAppTicks, and not "every tick": see kAcquisitionDrainPeriodMs in
+  // board.h for both bounds. In one line — draining faster than the producer makes
+  // AcquisitionService record empty updates as stale readings.
+  if ((app_ticks_ % kAcquisitionDrainEveryAppTicks) != 0U) {
+    return;
+  }
+
+  stats_.acquisition_drains++;
+  (void)acquisition_.update();
+}
+
+void Node::recompute_control(uint32_t now_ms, uint32_t now_us_value,
+                             const AnalogSnapshot &snapshot) {
+  // The NFR-1.8 marker, toggled at the control evaluation rather than at task entry: the
+  // app task wakes 40 times a second and the control period is one second, so a marker at
+  // entry would measure the scheduler's period and say nothing about the loop. This is the
+  // edge the analyzer capture pairs with the previous one to give the period, and it is the
+  // same instant the series below is sampled at.
+  if (hw_.gpio != nullptr) {
+    hw_.gpio->toggle(hw_.gpio->ctx, kPinTraceControl);
+  }
+
+  // The period, measured with the microsecond clock rather than assumed to be the nominal
+  // 1 s. What it contains: the hardware block period (which is exact) plus however late the
+  // scheduler ran this task relative to the block boundary it crossed (which is not, and is
+  // bounded by the app task's period). The deviation histogram therefore shows the
+  // quantisation first and any scheduling trouble second, and the mean shows whether the
+  // count of blocks and the wall clock agree over the window — which is the check that the
+  // 1 kHz trigger is really 1 kHz.
+  if (hw_.clock != nullptr && have_last_control_us_) {
+    timing_.note_period_us(now_us_value - last_control_us_);
+    note_timing_window();
+  }
+  last_control_us_ = now_us_value;
+  have_last_control_us_ = true;
+
+  stats_.control_evaluations++;
+  (void)control_.update(now_ms, snapshot);
+
+  // The fail-safe latch is re-decided here and only here: this is the one place the loop
+  // looks at the reading, so it is the one place where "the pump may run again" can be
+  // established. A tick that finds the reading unusable sets the latch; this clears it only
+  // when the loop has just decided a new window on a fresh reading.
+  fail_safe_latched_ = !snapshot.fresh();
+}
+
+void Node::apply_gate(uint32_t now_ms, const AnalogSnapshot &snapshot) {
+  if (hw_.actuator == nullptr) {
+    return;
+  }
+
+  // The fail-safe (decision 8), on every tick rather than once per control period: a probe
+  // that goes silent mid-window must stop the pump at the next 25 ms tick, not up to a
+  // second later. `fresh()` and not `valid`, for the same reason the display checks it:
+  // AcquisitionService keeps the last good value after a failure, so `valid` stays true
+  // through a dead DMA channel and a loop that trusted it would water a pot on the strength
+  // of a number that stopped changing minutes ago.
+  if (!snapshot.fresh()) {
+    fail_safe_latched_ = true;
+    stats_.fail_safe_ticks++;
+  }
+
+  // The window inside the loop's last decision, gated by the latch above.
+  const bool want_on = !fail_safe_latched_ && control_.window().on(now_ms);
+
+  if (want_on == gate_on_) {
+    return;
+  }
+
+  if (want_on) {
+    if (hw_.actuator->on != nullptr) {
+      hw_.actuator->on(hw_.actuator->ctx);
+      stats_.gate_on_edges++;
+    }
+  } else {
+    // Always safe to call, at any time, repeatedly: hal/actuator.h's contract, and the
+    // reason this is the branch taken for every failure above.
+    if (hw_.actuator->off != nullptr) {
+      hw_.actuator->off(hw_.actuator->ctx);
+      stats_.gate_off_edges++;
+    }
+  }
+  gate_on_ = want_on && hw_.actuator->on != nullptr;
+}
+
+uint32_t Node::now_us() const {
+  if (hw_.clock == nullptr || hw_.clock->now_us == nullptr) {
+    return 0U;
+  }
+  return hw_.clock->now_us(hw_.clock->ctx);
+}
+
+void Node::note_timing_window() {
+  // The timing service ignores samples once its window is full and says so, so a caller
+  // that never reports never notices it has lost the data. Nothing in Phase 1 pulls the
+  // series off the board yet (see the report on the interface gap), so what this can do is
+  // count the completed windows and reset, keeping the measurement running — a node that
+  // silently stopped recording after 17 minutes would make NFR-1.8's "measured, not
+  // assumed" true only for the first 17 minutes of the run.
+  if (timing_.full()) {
+    stats_.timing_windows++;
+    timing_.reset();
   }
 }
 

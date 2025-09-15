@@ -27,6 +27,9 @@
 #include "app/board.h"
 #include "app/comms.h"
 #include "app/node.h"
+#include "hal/adc.h"
+#include "hal/actuator.h"
+#include "hal/clock.h"
 #include "hal/gpio.h"
 #include "hal/i2c.h"
 #include "hal/system.h"
@@ -148,8 +151,14 @@ void scan_bus() {
     // and the unsigned masks turn that into an int-to-unsigned conversion.
     const uint32_t address = addr;
     line.ch(hex[(address >> 4) & 0x0FU]).ch(hex[address & 0x0FU]);
-    if (addr == node::kAddrSht31) {
-      line.str("  (SHT31 sensor)");
+    // Labelled so that the scan says what it found rather than only that something
+    // answered. The BMP280 is expected here and is deliberately never read: pressure is
+    // not on any requirement path, and a label that named it as "unused" would be wrong —
+    // it is on the bus, it is just not this firmware's business.
+    if (addr == node::kAddrAht20) {
+      line.str("  (AHT20 temperature/humidity)");
+    } else if (addr == node::kAddrBmp280) {
+      line.str("  (BMP280 pressure - present, not read)");
     } else if (addr == node::kAddrSsd1306) {
       line.str("  (SSD1306 display)");
     }
@@ -189,6 +198,12 @@ node::NodeHardware make_hardware() {
   hardware.uart = hal_uart_stm32f1();
   hardware.watchdog = hal_watchdog_stm32f1();
   hardware.system = hal_system_stm32f1();
+  // Phase 1. The ADC interface is the real one; the node wraps it in its own ISR-stamping
+  // decorator for NFR-1.9, so what is handed over here is the peripheral and not the
+  // instrumented view of it.
+  hardware.adc = hal_adc_stm32f1();
+  hardware.actuator = hal_actuator_stm32f1();
+  hardware.clock = hal_clock_stm32f1();
   return hardware;
 }
 

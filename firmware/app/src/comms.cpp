@@ -303,6 +303,24 @@ size_t CommsService::format_telemetry(char *out, size_t capacity) const {
     line.str("T=n/a RH=n/a");
   }
 
+  // The primary quantity, and the one the control loop acts on. Reported in permille of
+  // the probe's calibrated span, which is the unit the loop and the setpoint command both
+  // use, so a host can compare the reading with `get` without converting anything.
+  if (sources_.acquisition != nullptr) {
+    const AnalogSnapshot moist = sources_.acquisition->snapshot();
+    if (moist.valid) {
+      line.str(" moist=").u32(static_cast<uint32_t>(moist.moisture_permille));
+      if (!moist.fresh()) {
+        // A reading that has stopped being refreshed is flagged rather than hidden: the
+        // failure this prevents is a host logging a frozen number as live soil moisture,
+        // which is the same failure the display's staleness counter exists to prevent.
+        line.str("(stale)");
+      }
+    } else {
+      line.str(" moist=--");
+    }
+  }
+
   if (sources_.arbiter != nullptr) {
     const ArbiterStats bus = sources_.arbiter->stats();
     line.str(" bus=")
@@ -371,6 +389,33 @@ void CommsService::send_status() {
         .u32(sup.misses)
         .str(" worst=")
         .u32(sup.worst_lateness_ms);
+  }
+
+  // Phase 1. `adc=` is blocks received/counted by the DMA consumer/dropped by the ring —
+  // the three numbers that say whether the analog channel is real — and `ctl=` is control
+  // evaluations, fail-safe windows and saturations, which is how a node whose pump is not
+  // running says which of the three reasons it is.
+  //
+  // Deliberately counts rather than the timing series: that one is single-writer and is
+  // reported by the app task, not here. See CommsSources.
+  if (sources_.acquisition != nullptr) {
+    const AcquisitionStats adc = sources_.acquisition->stats();
+    line.str(" adc=")
+        .u32(adc.blocks_received)
+        .str("/")
+        .u32(adc.blocks_processed)
+        .str("/")
+        .u32(adc.blocks_dropped);
+  }
+
+  if (sources_.control != nullptr) {
+    const ControlStats ctl = sources_.control->stats();
+    line.str(" ctl=")
+        .u32(ctl.evaluations)
+        .str("/")
+        .u32(ctl.fail_safe_windows)
+        .str("/")
+        .u32(ctl.saturated_windows);
   }
 
   send_line(line.c_str());

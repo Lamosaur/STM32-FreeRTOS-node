@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "app/acquisition.h"
 #include "app/board.h"
 #include "app/control.h"
 #include "app/display.h"
@@ -102,6 +103,22 @@ struct CommsSources {
   // aggregate initialisers at existing call sites keep meaning what they meant; a field
   // inserted in the middle would silently rebind every initialiser after it.
   ControlTuningStore *tuning = nullptr;
+
+  // Phase 1's two read-only sources, appended after `tuning` for the same reason.
+  //
+  // They exist so that the analog channel and the control loop are visible over the link
+  // without a debugger: `moist=`, `adc=` and `ctl=` on the status and telemetry lines. That
+  // is the difference between "the wiring is in the image" (which nm can show) and "the
+  // wiring is doing something" (which needs a number, and which on a bench is the first
+  // question asked of a node whose pump is not running).
+  //
+  // The timing service is deliberately NOT here. It is single-writer by design (its header
+  // explains why: a lock on the sample path would perturb the jitter it measures), so a
+  // report from this task would be a race against the control task. Getting NFR-1.8's
+  // numbers off the board needs the app task to format them into a handover buffer, which
+  // is a change to that class rather than to this source list.
+  const AcquisitionService *acquisition = nullptr;
+  const ControlLoop *control = nullptr;
 };
 
 class CommsService {
