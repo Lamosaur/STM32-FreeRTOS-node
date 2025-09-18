@@ -41,6 +41,9 @@ scratch/
 # unit tests, `build-arm/` is the cross-compiled firmware image.
 build/
 build-arm/
+# A suffixed variant is a deliberate second tree, used to check the project builds
+# under both ARM toolchains that can be selected (see cmake/arm-none-eabi.cmake).
+build-arm-*/
 
 # CMake's compile_commands.json is generated per build tree, and clang-tidy reads the
 # copy inside build/. Nothing generated belongs in the repository.
