@@ -8,7 +8,9 @@
 # They are OBJECT libraries rather than STATIC ones because several symbols here are
 # *strong overrides of weak defaults* inside the vendored driver (HAL_InitTick,
 # HAL_MspInit, HAL_I2C_MspInit/MspDeInit, HAL_UART_MspInit/MspDeInit,
-# HAL_I2C_MasterTxCpltCallback, HAL_I2C_ErrorCallback). A weak definition inside an
+# HAL_ADC_MspInit, HAL_ADC_ConvHalfCpltCallback, HAL_ADC_ConvCpltCallback,
+# HAL_ADC_ErrorCallback, HAL_I2C_MasterTxCpltCallback, HAL_I2C_ErrorCallback,
+# DMA1_Channel1_IRQHandler). A weak definition inside an
 # archive member wins by default, so a static library would silently keep the stock
 # SysTick-based HAL_InitTick — which would fight FreeRTOS for SysTick. As objects, both
 # definitions are always present and the linker resolves the strong one. --gc-sections
@@ -22,6 +24,8 @@ set(HAL_DIR ${THIRD_PARTY_DIR}/stm32f1xx-hal-driver)
 # statement that the firmware uses it.
 add_library(node_hal_stm32f1_vendor OBJECT
   ${HAL_DIR}/Src/stm32f1xx_hal.c
+  ${HAL_DIR}/Src/stm32f1xx_hal_adc.c
+  ${HAL_DIR}/Src/stm32f1xx_hal_adc_ex.c
   ${HAL_DIR}/Src/stm32f1xx_hal_cortex.c
   ${HAL_DIR}/Src/stm32f1xx_hal_dma.c
   ${HAL_DIR}/Src/stm32f1xx_hal_gpio.c
@@ -31,6 +35,7 @@ add_library(node_hal_stm32f1_vendor OBJECT
   ${HAL_DIR}/Src/stm32f1xx_hal_rcc.c
   ${HAL_DIR}/Src/stm32f1xx_hal_rcc_ex.c
   ${HAL_DIR}/Src/stm32f1xx_hal_tim.c
+  ${HAL_DIR}/Src/stm32f1xx_hal_tim_ex.c
   ${HAL_DIR}/Src/stm32f1xx_hal_uart.c)
 
 # SYSTEM: the vendored HAL and CMSIS headers are third-party, so their internal warnings
@@ -57,6 +62,8 @@ target_include_directories(node_hal_stm32f1_vendor PUBLIC ${CMAKE_CURRENT_SOURCE
 # ---------------------------------------------------------------------------
 add_library(node_hal_stm32f1 OBJECT
   hal_stm32f1.c
+  hal_adc_stm32f1.c
+  hal_actuator_stm32f1.c
   hal_gpio_stm32f1.c
   hal_i2c_stm32f1.c
   hal_uart_stm32f1.c

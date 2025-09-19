@@ -198,6 +198,15 @@ class FakeI2c {
     return last_tx_;
   }
 
+  // Length of the most recent transfer's read phase. A driver's framing is as much a part of
+  // its correctness as its arithmetic — reading six bytes of a seven-byte frame, or seven of
+  // a six-byte one, is exactly the mistake a sensor swap invites — so the length it asked
+  // for is observable rather than implied by whatever bytes happened to be in the reply.
+  size_t last_rx_len() const {
+    std::lock_guard<std::mutex> g(mtx_);
+    return last_rx_len_;
+  }
+
   // The SCL edges emitted during the most recent recovery, in order. true = rising.
   std::vector<bool> scl_edges() const {
     std::lock_guard<std::mutex> g(mtx_);
