@@ -85,16 +85,56 @@ TuningField tuning_error(const ControlTuning &tuning) {
 
 ControlTuningStore::ControlTuningStore() = default;
 
+const ControlTuning &ControlTuningStore::reader_value(uint32_t before, uint32_t after,
+                                                      const ControlTuning &speculative,
+                                                      const ControlTuning &previous) {
+  // Odd `before`: a publication was in flight when the copy was taken, so the slot it came from
+  // is not one the sequence names as published. (It is the *previous* set — the writer is in
+  // the other slot — but the caller already has a value it can keep, and one period of
+  // staleness is cheaper than a second copy that could collide in its turn.)
+  if ((before & 1U) != 0U) {
+    return previous;
+  }
+
+  // `after` differing means a publication landed while the copy was being taken, which is the
+  // case the two-slot scheme this replaces got wrong. An odd `after` is the same condition and
+  // not a separate one: `before` is known even by here, so the two checks in the protocol
+  // described in the header are this one comparison.
+  if (after != before) {
+    return previous;
+  }
+
+  return speculative;
+}
+
+ControlTuning ControlTuningStore::load_or(const ControlTuning &previous) const {
+  // One acquire load, the copy, one acquire load: the whole reader, and it never waits. The
+  // acquire pairs with the release in publish(), so a reader that observes an even sequence
+  // value observes the slot contents published with it; and the reader's own two loads of one
+  // location cannot run backwards, so their agreeing means the sequence stood still while the
+  // copy was taken — see the header for why that is what makes the copy whole.
+  const uint32_t before = sequence_.load(std::memory_order_acquire);
+
+  // The copy is taken unconditionally — even while the sequence is odd — so that the decision
+  // stays in one place (reader_value) instead of being split across an early return here and a
+  // rule there. It is not merely wasted in that case: whenever the sequence reads s, the slot
+  // (s / 2) % kSlots is not the one being written. An even 2n means publication n has finished
+  // and publication n + 1 has not begun its field stores (those follow the increment to 2n + 1),
+  // so nothing is being written at all; an odd 2n - 1 means publication n is filling slot
+  // n % 2 while the reader is on (n - 1) % 2. reader_value discards the copy in the odd case,
+  // which is the price: one 24-byte copy on the reads that are refused anyway.
+  const ControlTuning speculative = slots_[(before / 2U) % kSlots];
+  const uint32_t after = sequence_.load(std::memory_order_acquire);
+
+  return reader_value(before, after, speculative, previous);
+}
+
 ControlTuning ControlTuningStore::load() const {
-  // One load, then the slot it named. Acquire, pairing with the release in publish(): a
-  // reader that observes the new index is guaranteed to observe the slot contents that
-  // were written before it.
-  const uint32_t index = active_.load(std::memory_order_acquire);
-  // The index is only ever 0 or 1. The mask is here so that remains a property of this
-  // load rather than of every writer that will ever exist; without it, a future writer
-  // that stored something else would read outside the array, and that is a fault the
-  // control task cannot absorb.
-  return slots_[index & 1U];
+  // The stateless form. A call with no argument has no previous value to keep, so it offers the
+  // one the store has: what it was constructed holding. See the header for the callers (the
+  // writer task's own reads, which cannot collide with its own publications) and for why a
+  // reader that must keep the operator's tuning keeps it itself and calls load_or().
+  return load_or(ControlTuning{});
 }
 
 bool ControlTuningStore::publish(const ControlTuning &next) {
@@ -104,19 +144,30 @@ bool ControlTuningStore::publish(const ControlTuning &next) {
     return false;
   }
 
-  // Relaxed on the read of the index: only the publishing task ever writes it, so there is
-  // nothing to synchronise with here. The ordering that matters is the release below.
-  const uint32_t current = active_.load(std::memory_order_relaxed);
-  const uint32_t inactive = current ^ 1U;
+  // Relaxed on this read: only the publishing task ever writes the sequence, so there is
+  // nothing to synchronise with on the way in. The ordering that matters is the release below.
+  const uint32_t before = sequence_.load(std::memory_order_relaxed);
 
-  // The writer never touches the slot the reader may be copying. That single-sided rule is
-  // what makes a torn read impossible without a lock: whatever a reader is doing, the bytes
-  // it is reading are not being written.
-  slots_[inactive] = next;
+  // The slot this publication goes to. The reader derives the *published* slot from the sequence
+  // as (sequence / 2) % kSlots and, as load_or() sets out, the slot it derives is never the one
+  // being written — so the two never meet, and the writer only has to stay on the other one. The
+  // sequence is `before` here, so the published slot is (before / 2) % kSlots and this
+  // publication, which leaves the sequence at before + 2, takes the other one.
+  const uint32_t next_slot = ((before / 2U) + 1U) % kSlots;
 
-  // The publication point. Release, so every store above is visible to a reader that
-  // observes this index.
-  active_.store(inactive, std::memory_order_release);
+  // Odd before any field store, which is the reader's "a publication is in flight" signal. The
+  // field stores cannot become visible before it on either target — x86-64 retires stores in
+  // order, and the Cortex-M3 is one in-order core with no data cache — and the compiler will
+  // not move them across an atomic store. A release fence here, or release on each field, is
+  // the belt-and-braces version for a weakly ordered multi-core part; it is not needed by
+  // either of this project's two, and on ARMv7-M it would cost a `dmb` per field.
+  sequence_.store(before + 1U, std::memory_order_relaxed);
+
+  slots_[next_slot] = next;
+
+  // The publication point. Release, so a reader that observes this value — and only such a
+  // reader — is guaranteed to observe the slot contents stored above it.
+  sequence_.store(before + 2U, std::memory_order_release);
   return true;
 }
 
@@ -255,12 +306,17 @@ ControlLoop::ControlLoop(const ControlTuningStore *tuning, uint32_t control_peri
     : tuning_(tuning), window_(control_period_ms), control_period_ms_(control_period_ms) {}
 
 ControlDecision ControlLoop::update(uint32_t now_ms, const AnalogSnapshot &snapshot) {
-  // Read the tuning once, at the top. Once, because a caller that sees the setpoint in the
-  // decision must be looking at the setpoint that produced it: re-reading mid-evaluation
-  // would allow a decision whose terms came from one set of gains and whose reported
-  // setpoint came from another, which is exactly the incoherence decision 9's
-  // publication scheme exists to avoid.
-  const ControlTuning tuning = tuning_ != nullptr ? tuning_->load() : ControlTuning{};
+  // Read the tuning once, at the top, and keep the answer: a read that collided with a
+  // publication in flight leaves last_tuning_ alone, so the loop carries on with the set it
+  // already had rather than with a mixture of two (see ControlTuningStore). Once, because a
+  // caller that sees the setpoint in the decision must be looking at the setpoint that produced
+  // it: re-reading mid-evaluation would allow a decision whose terms came from one set of gains
+  // and whose reported setpoint came from another, which is exactly the incoherence decision
+  // 9's publication scheme exists to avoid.
+  if (tuning_ != nullptr) {
+    last_tuning_ = tuning_->load_or(last_tuning_);
+  }
+  const ControlTuning &tuning = last_tuning_;
   pid_.set_tuning(tuning);
 
   ControlDecision decision{};

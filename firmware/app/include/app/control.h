@@ -22,12 +22,15 @@
  * caller applies it. That split is also what makes every claim below testable on the host.
  *
  * Why there is no mutex here, restated because it is the one decision a reader is most
- * likely to "fix". The loop reads the tuning through a two-slot store and a single atomic
- * index. A mutex would be worse than useless: it would put a lock acquisition inside the
- * very loop whose jitter NFR-1.8 measures, and it is itself an instance of the
- * priority-inversion case FR-1.7 exists to measure — the control task (priority 3) waiting
- * on a lock the display task (priority 1) holds while it clocks out an OLED frame. A
- * tuning value is not worth either cost. See ControlTuningStore for what replaces it.
+ * likely to "fix". The loop reads the tuning through a seqlock: two slots and one atomic
+ * sequence counter, read without ever waiting — a reader that meets a publication in flight
+ * keeps the value it already had, and a control period later picks up the new one. A mutex
+ * would be worse than useless: it would put a lock acquisition inside the very loop whose
+ * jitter NFR-1.8 measures, and it is itself an instance of the priority-inversion case
+ * FR-1.7 exists to measure — the control task (priority 3) waiting on a lock the display
+ * task (priority 1) holds while it clocks out an OLED frame. A tuning value is not worth
+ * either cost. See ControlTuningStore for what replaces it, and for why the reader must not
+ * spin even in a lock-free scheme.
  *
  * Nothing here allocates, blocks, yields or locks, and none of it can: the loop's only
  * inputs are a millisecond timestamp and a snapshot that the caller has already taken.
@@ -54,8 +57,11 @@ namespace node {
 // Everything a host can change at run time (FR-1.4). One struct rather than separate
 // setpoint/gain/limit setters, because the two rules that matter are about the *set*: the
 // fields are validated together (a duty cap that cannot deliver a minimum on-time is a
-// pump that never runs), and they are published together, so a reader can never see a new
-// setpoint with the old gains and act on the mixture.
+// pump that never runs), and they are published together, so a reader gets a whole set or
+// none of it and never a new setpoint carrying the old gains — a reader either observes one
+// complete publication or keeps the value it already had. That second half is a property of
+// the store rather than of this struct, and it is the one ControlTuningStore documents at
+// length, because the scheme it replaces claimed it and did not deliver it.
 //
 // The limits are here rather than being compile-time constants because they are part of
 // the safety envelope an operator may want to tighten — turning a 50 % cap into 20 % for a
@@ -94,33 +100,96 @@ inline bool tuning_valid(const ControlTuning &tuning) {
   return tuning_error(tuning) == TuningField::None;
 }
 
-// The setpoint, gains and limits, published by one task and read by another without a
-// lock (decision 9).
+// The setpoint, gains and limits, published by one task and read by another without a lock
+// (decision 9).
 //
 // The mechanism, in full, because "lock-free" is a claim that has to be discharged rather
-// than asserted. Two slots are kept. The writer never touches the slot the reader is
-// using: it fills the inactive one and then stores its index into an atomic. The reader
-// loads that index once and copies the slot it names.
+// than asserted — and because the obvious way to do it is wrong in a way that stays invisible
+// until it is not. This is a seqlock: two slots and one atomic sequence counter, odd while a
+// publication is in flight.
 //
-// Why that is enough, on this target:
+//   The writer (publish(), the comms task, and only ever that task), in this order:
+//     s = sequence (even);  sequence = s + 1 (odd, relaxed);
+//     slots[(s / 2 + 1) % kSlots] = next;
+//     sequence = s + 2 (even, release).
 //
-//   - A reader can never observe a half-written tuning, because the writer only ever
-//     writes a slot the reader is not reading. The index store is the publication point,
-//     with release ordering, so the reader that observes the new index observes the slot
-//     contents that go with it.
-//   - A reader *can* read a stale tuning — it copies the old slot if the index changed
-//     after it loaded it. That is harmless for a tuning value: every published set is a
-//     complete, valid set, and one control period (1000 ms) spent on the previous one is
-//     not a fault. This is the property that makes a lock unnecessary rather than merely
-//     inconvenient: the data has no invariant that spans a read.
-//   - On a single-core Cortex-M3 with 32-bit aligned access, a torn *word* is impossible
-//     in the first place (no store tearing, no unaligned splitting), and std::atomic
-//     makes the intent explicit and portable rather than relying on that.
+//   The reader (load_or(), the control task), in this order:
+//     s1 = sequence (acquire);  copy = slots[(s1 / 2) % kSlots];  s2 = sequence (acquire);
+//     if s1 == s2 and s1 is even, `copy` is a whole publication; otherwise the caller keeps
+//     the value it already had and the read is over.
 //
-// The writer is single — the comms task. Two writers would need arbitration, and that is
-// the point at which this design would need rethinking rather than extending: publication
-// is a single producer's job. This is documented rather than enforced, because the
-// alternative (a lock in the writer) would put the lock back in the reader's path.
+// Why a frozen, even sequence proves the copy is whole. The writer's stores to slots_ all lie
+// strictly between the odd increment and the even one: it goes odd before its first field
+// store and even — released — after its last. A thread's own loads of one location cannot run
+// backwards, so a reader whose two loads of the sequence both return the same value 2n knows
+// the sequence stood at 2n for the whole interval between them: had it moved on, the second
+// load would have returned the value it moved to. The writer cannot reach its next field store
+// without first incrementing the sequence past 2n, so no field store of any publication
+// overlapped the copy, and slot (2n / 2) % kSlots still holds exactly the set the sequence
+// names. The acquire load pairs with the release that published that set, so the copy cannot be
+// an *older* set than the one the sequence names either: the fields written before that release
+// happen-before the copy that read the value the release stored.
+//
+// All three ways the window can be dirty are refused: the sequence was odd when the copy began
+// (a publication was in flight), it was odd when the copy ended, or it changed in between. The
+// last is the one that made the previous version of this class wrong, and it is not a corner
+// case: a host sending `set sp=`, `set kp=` and `set ki=` in one burst publishes three times
+// back to back, and a reader that copied a slot while the writer came back around to that same
+// slot returned a mixture of two sets — plausible-looking, wrong, and acted on for a whole
+// control period. Under the sequence check the same burst costs a reader the value it already
+// had, which is the correct answer and the only cost this scheme has.
+//
+// The rule is deliberately conservative in one direction, and it is worth being explicit about
+// which. With an even s1 and s2 = s1 + 2 exactly one publication landed, and it wrote the slot
+// the reader is *not* copying, so that copy was in fact whole — and the reader refuses it
+// anyway, because two observations cannot tell it apart from the window in which the writer kept
+// going. A narrower rule (accept while the sequence has advanced by at most one publication) is
+// provable from the same argument and would buy back those reads; it costs a second reading of
+// the argument above for every future reader of this file, and a refused read costs one control
+// period of a value the operator has just replaced. The simpler rule is the one that belongs in
+// a reader on the control path.
+//
+// Why the reader keeps its previous value instead of retrying until the sequence is stable,
+// which is the version of a seqlock a reader is most likely to "fix". The control task
+// (priority 3) outranks the comms task (priority 1) and this part has one core: a retry loop
+// waits for progress from a task that cannot run while the waiter runs, so on the target it is
+// a livelock with extra steps rather than a wait. Not retrying costs at most one control period
+// (1000 ms) of staleness on the read that collided — the loop acts on the set it already had,
+// once, and its next evaluation is at most a period later — and publications are rare by
+// construction: a human typing on a host link, not a stream of samples. That is also what makes
+// a lock unnecessary rather than merely inconvenient. The data has no invariant that spans a
+// read: a *stale* set is a value the operator just replaced, while a *mixed* one is a loop
+// nobody asked for, so only the second is a fault.
+//
+// Where the "previous value" lives, and why it is not a member here. It is the caller's, passed
+// in and returned by load_or(). This store has two readers — the control task, and the comms
+// task's `tune` report and read-modify-write base for `set` — so a fallback cached in the store
+// would be a 24-byte read-modify-write shared by both tasks, which is the same torn-copy race
+// this class exists to avoid, one level down. So the reader that must not lose the operator's
+// tuning keeps it itself (ControlLoop), and the stateless load() says plainly what it does
+// instead of pretending: see its comment.
+//
+// On a single-core Cortex-M3 with 32-bit aligned access, a torn *word* was never the problem
+// (no store tearing, no unaligned splitting), and std::atomic makes the intent explicit and
+// portable rather than relying on that. What the sequence counter buys is the guarantee about
+// the *set*: no reader of this class returns a mixture of two of them.
+//
+// What this still does not claim, stated plainly, because the previous version of this comment
+// claimed more than the code delivered. The slots are plain objects, so a copy taken while the
+// writer is filling the slot it names is a data race as the C++ abstract machine defines the
+// term — every C++ seqlock has that shape, and what makes this one safe is the argument above
+// together with what the two targets do: the first acquire load is a compiler barrier, so the
+// plain loads cannot be hoisted above it (and GCC and Clang do not move memory operations across
+// an atomic in either direction), x86-64 retires stores in order, and the Cortex-M3 is a single
+// in-order core with no data cache. The strictly-conforming variant is a slot of relaxed atomic
+// fields: it costs a duplicated field list and no instructions, and it removes the data-race
+// objection without removing the need for exactly this sequence check — so it is a change to make
+// deliberately, not something a comment can wish away.
+//
+// The writer is single — the comms task. Two writers would need arbitration, and that is the
+// point at which this design would need rethinking rather than extending: publication is a
+// single producer's job. This is documented rather than enforced, because the alternative (a
+// lock in the writer) would put the lock back in the reader's path.
 class ControlTuningStore {
  public:
   ControlTuningStore();
@@ -128,18 +197,53 @@ class ControlTuningStore {
   ControlTuningStore(const ControlTuningStore &) = delete;
   ControlTuningStore &operator=(const ControlTuningStore &) = delete;
 
-  // The reader's side: load the index once, then copy the slot it names. Safe to call from
-  // the control task at any time, and deliberately cheap (one atomic load, one 24-byte
-  // copy) because it is on the control path.
+  // The reader's side, for a caller that has a value of its own to keep: the newest complete
+  // publication, or `previous` unchanged when the read met a publication in flight or one that
+  // landed under the copy. Deliberately cheap — one atomic load, one 24-byte copy, one atomic
+  // load — because it is on the control path, and it never waits (see above for why it must
+  // not). Safe to call from the control task at any time.
+  ControlTuning load_or(const ControlTuning &previous) const;
+
+  // The stateless form, for a caller with no value to keep: the `tune` report and the
+  // read-modify-write base for `set` in comms.cpp. A collided read returns the compiled-in
+  // defaults, which are what the store is constructed holding — a complete, valid set, and the
+  // only "previous value" a call with no argument can have.
+  //
+  // In this firmware that branch is not reachable through load(): the only publisher is the
+  // comms task (comms.cpp), load()'s only callers are in that same task, and a task cannot
+  // collide with its own publication — the sequence cannot move between two loads taken by the
+  // thread that moves it. A reader that must not lose the operator's tuning to a collided read
+  // — the control loop — keeps it and calls load_or() instead. Nothing here enforces that; it
+  // is a consequence of the single-writer contract above, and a second task calling load()
+  // would get the defaults for one period rather than a mixture.
   ControlTuning load() const;
 
   // The writer's side. Refuses an invalid tuning and leaves the published one in force,
-  // returning false. Otherwise fills the inactive slot and swaps the index.
+  // returning false. Otherwise it runs the sequence protocol at the top of this comment.
   bool publish(const ControlTuning &next);
 
+  // The reader's rule on its own, as a pure function of the seqlock's observations: `before`
+  // and `after` are the sequence loads taken either side of `speculative` (the caller's copy of
+  // slot (before / 2) % kSlots), and `previous` is the value the caller already had. The result
+  // is `speculative` when it is a whole publication and `previous` otherwise.
+  //
+  // It is pulled out — static, and public — because its refusals are the one part of this class
+  // a test cannot otherwise reach on purpose: making a publication land under a copy takes a
+  // concurrent writer, so a test that can only drive load_or() catches a broken rule
+  // probabilistically, on the runs where the interleaving happens to occur. Handing it the two
+  // sequence values pins the rule itself, deterministically, in every case.
+  static const ControlTuning &reader_value(uint32_t before, uint32_t after,
+                                           const ControlTuning &speculative,
+                                           const ControlTuning &previous);
+
  private:
-  ControlTuning slots_[2]{};
-  std::atomic<uint32_t> active_{0};
+  // Two slots. The writer is one task publishing in order, so the slot a publication goes to
+  // alternates and the reader's derivation from the sequence names it exactly; the derivation
+  // is modulo kSlots so that a different count would still work, but nothing here needs one.
+  static constexpr uint32_t kSlots = 2;
+
+  ControlTuning slots_[kSlots]{};
+  std::atomic<uint32_t> sequence_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -335,6 +439,12 @@ class ControlLoop {
   // the reading is absent or stale, abort the window and report zero output without
   // evaluating the law (the integral is *held*, not unwound); otherwise evaluate the PID,
   // convert the duty to an on-time, apply the minimum on-time rule, and open the window.
+  //
+  // "Read the tuning" is `load_or(last_tuning_)`: a read that collides with a publication in
+  // flight leaves last_tuning_ — and therefore this evaluation — on the set the loop already
+  // had. One control period of staleness is the price of never waiting on the comms task; see
+  // ControlTuningStore for why waiting is not an option here and why the value is kept by the
+  // loop rather than by the store.
   ControlDecision update(uint32_t now_ms, const AnalogSnapshot &snapshot);
 
   const ControlDecision &last() const { return last_; }
@@ -352,6 +462,13 @@ class ControlLoop {
   PidController pid_;
   WindowOutput window_;
   uint32_t control_period_ms_;
+
+  // The tuning in force: what the last read of the store accepted, or the compiled-in defaults
+  // before the first one (which is what the store is constructed holding, so the two agree at
+  // startup). It is the loop's, not the store's, because this is the only reader that must not
+  // lose the operator's tuning to a collided read — see ControlTuningStore's comment on where
+  // the reader's previous value lives.
+  ControlTuning last_tuning_{};
 
   // The previous evaluation's timestamp, and whether there has been one. One timestamp
   // serves both the sample interval and the decision to use the nominal period first:

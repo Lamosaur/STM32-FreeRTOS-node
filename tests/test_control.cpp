@@ -78,6 +78,31 @@ ControlTuning tuning_with(int32_t setpoint, int32_t kp, int32_t ki, int32_t kd =
   return tuning;
 }
 
+// A mixture of two published sets, spelled out field by field: the first three fields from one
+// publication and the last three from another. This is not a hypothetical value — it is what a
+// two-slot publication scheme returns whenever a second publication lands while the reader is
+// copying the slot the first one left live, and the whole point of it is that it is neither of
+// the two sets: every field is individually plausible and the combination is one nobody sent.
+ControlTuning mixed(const ControlTuning &first, const ControlTuning &second) {
+  ControlTuning mixture = first;
+  mixture.kd_milli = second.kd_milli;
+  mixture.min_on_time_ms = second.min_on_time_ms;
+  mixture.max_duty_permille = second.max_duty_permille;
+  return mixture;
+}
+
+// ControlTuning has no operator== and should not grow one — it is a wire-facing aggregate whose
+// fields carry different units, and a whole-struct equality is exactly the check that hides
+// which field was wrong. The store tests therefore compare it field by field.
+void expect_same_tuning(const ControlTuning &actual, const ControlTuning &expected) {
+  EXPECT_EQ(actual.setpoint_permille, expected.setpoint_permille);
+  EXPECT_EQ(actual.kp_milli, expected.kp_milli);
+  EXPECT_EQ(actual.ki_milli, expected.ki_milli);
+  EXPECT_EQ(actual.kd_milli, expected.kd_milli);
+  EXPECT_EQ(actual.min_on_time_ms, expected.min_on_time_ms);
+  EXPECT_EQ(actual.max_duty_permille, expected.max_duty_permille);
+}
+
 // Rounds to nearest, halves away from zero. The plant's state is kept in milli-permille
 // (a thousandth of a permille) so that a first-order lag with a 60-window time constant
 // does not lose its fractional part to truncation — which would bias the equilibrium the
@@ -290,6 +315,16 @@ TEST(ControlTuningStoreTest, PublishesAndLoadsCompleteTunings) {
   // is the whole point.
   EXPECT_TRUE(store.publish(tuning_with(600, 3000, 40)));
   EXPECT_EQ(store.load().setpoint_permille, 600);
+
+  // The reader that keeps a value of its own — the control loop's form of the read — sees the
+  // same publications, and never keeps a stale one by accident: with no writer running, every
+  // read is a fresh one.
+  ControlTuning held = store.load_or(ControlTuning{});
+  EXPECT_EQ(held.setpoint_permille, 600);
+  EXPECT_TRUE(store.publish(tuning_with(700, 3000, 40)));
+  held = store.load_or(held);
+  EXPECT_EQ(held.setpoint_permille, 700);
+  EXPECT_EQ(held.kp_milli, 3000);
 }
 
 TEST(ControlTuningStoreTest, RefusesAnInvalidPublishAndKeepsThePreviousTuning) {
@@ -299,45 +334,160 @@ TEST(ControlTuningStoreTest, RefusesAnInvalidPublishAndKeepsThePreviousTuning) {
   EXPECT_FALSE(store.publish(tuning_with(5000, 2000, 50)));
 
   // Refused means refused: the published tuning is still the one in force, not a partially
-  // applied set with a new setpoint and the old gains.
+  // applied set with a new setpoint and the old gains. Both forms of the read agree, which
+  // also says that a refused publication does not leave the sequence odd — a refusal that
+  // consumed a sequence step without publishing would make every later read collide.
   const ControlTuning current = store.load();
   EXPECT_EQ(current.setpoint_permille, 500);
   EXPECT_EQ(current.kp_milli, 2000);
   EXPECT_EQ(current.ki_milli, 50);
+  expect_same_tuning(store.load_or(ControlTuning{}), current);
+}
+
+// ---------------------------------------------------------------------------
+// The reader's rule, deterministically
+// ---------------------------------------------------------------------------
+//
+// The two tests below are the ones the racy test cannot be. A publication landing underneath a
+// copy needs a writer running concurrently with the reader, so a test that can only drive
+// load_or() catches a broken rule on the runs where the interleaving happens to occur — which
+// is how the defect this replaced survived its own test suite. reader_value() is the function
+// load_or() decides with, so handing it the two sequence observations directly pins the rule
+// itself, in every case, with no threads and no luck.
+
+TEST(ControlTuningStoreTest, AReaderThatMeetsAPublicationInFlightKeepsTheValueItHad) {
+  // The reader's value, the set the writer is publishing, and the copy a reader takes when the
+  // writer gets from the first to the second while that copy is in progress.
+  const ControlTuning held = tuning_with(500, 2000, 50, /*kd=*/7, /*min_on_ms=*/60,
+                                        /*max_duty=*/600);
+  const ControlTuning fresh = tuning_with(600, 3000, 60, /*kd=*/9, /*min_on_ms=*/80,
+                                          /*max_duty=*/700);
+  const ControlTuning torn = mixed(held, fresh);
+
+  // The premise, so that a test that passes cannot be passing because the two sets happen to be
+  // the same: the mixture differs from each of them in a field, and matches neither.
+  EXPECT_NE(torn.kd_milli, held.kd_milli);
+  EXPECT_NE(torn.min_on_time_ms, held.min_on_time_ms);
+  EXPECT_NE(torn.setpoint_permille, fresh.setpoint_permille);
+  EXPECT_NE(torn.kp_milli, fresh.kp_milli);
+
+  // Sequence 5 is odd: a publication is in flight, so the reader has no published set to name
+  // and the copy it took — of the previous publication's slot — is not one it may use.
+  expect_same_tuning(ControlTuningStore::reader_value(5, 5, torn, held), held);
+
+  // Sequence 6 → 10: two publications landed while the copy was being taken — the writer's
+  // `set sp=`/`set kp=`/`set ki=` burst — and the second of them writes the very slot the copy
+  // came from. (Publication m goes to slot m % 2 and the reader's slot at sequence 2n is
+  // n % 2, so at 6 the reader is on publication 3's slot, which publication 5 rewrites.) This is
+  // the exact case the scheme this replaces returned as though it were a set, and the reader
+  // must return `held` instead of the mixture.
+  expect_same_tuning(ControlTuningStore::reader_value(6, 10, torn, held), held);
+
+  // Sequence 6 → 8: one publication landed, and it wrote the *other* slot, so a copy taken in
+  // this window is in fact whole — and the rule refuses it anyway. That is the deliberate
+  // conservative direction the store documents: two observations cannot tell this window from
+  // the one above, and the price of not asking a third time is one control period.
+  expect_same_tuning(ControlTuningStore::reader_value(6, 8, fresh, held), held);
+
+  // Sequence 6 → 7: a publication began under the copy. Refused for the same reason, and it is
+  // the same comparison — `after` odd is not a case of its own, because `before` is already
+  // known to be even by the time the rule is applied.
+  expect_same_tuning(ControlTuningStore::reader_value(6, 7, torn, held), held);
+
+  // The one accepted case: the sequence was even and unchanged across the copy, so the copy is
+  // a whole publication and there is nothing to keep.
+  expect_same_tuning(ControlTuningStore::reader_value(6, 6, fresh, held), fresh);
+
+  // A 32-bit sequence wraps, and the rule does not care: left where it started is a whole
+  // publication, odd is a write in flight. There is no 2^32-publication wrap inside one copy to
+  // worry about — that would be four billion host commands in six instructions — and the wrap
+  // itself is defined for an unsigned counter rather than being a case to handle.
+  expect_same_tuning(ControlTuningStore::reader_value(0, 0, fresh, held), fresh);
+  expect_same_tuning(
+      ControlTuningStore::reader_value(UINT32_MAX, UINT32_MAX, torn, held), held);
+}
+
+TEST(ControlTuningStoreTest, ACollidingReadDoesNotLoseTheNextPublication) {
+  // What a collided read costs is one control period, not the host's command. The value it
+  // keeps is a value, not a latch: the publication the read missed has to be visible to the
+  // next read, in full — which is also what rules out the tempting "merge the two" fix, where
+  // the fields the collision kept would survive into the next set.
+  ControlTuningStore store;
+  ASSERT_TRUE(store.publish(tuning_with(500, 2000, 50, /*kd=*/7, /*min_on_ms=*/60,
+                                        /*max_duty=*/600)));
+
+  ControlTuning held = store.load_or(ControlTuning{});
+  ASSERT_EQ(held.setpoint_permille, 500);
+
+  // The collided read, driven through the real rule: sequence 3 is odd, so a publication is in
+  // flight and the copy it left is refused.
+  const ControlTuning fresh = tuning_with(600, 3000, 60, /*kd=*/9, /*min_on_ms=*/80,
+                                          /*max_duty=*/700);
+  const ControlTuning after_collision =
+      ControlTuningStore::reader_value(3, 3, mixed(held, fresh), held);
+  expect_same_tuning(after_collision, held);
+  held = after_collision;
+
+  // The writer finishes the set the collided read missed. The next read sees all of it.
+  ASSERT_TRUE(store.publish(fresh));
+  held = store.load_or(held);
+  expect_same_tuning(held, fresh);
 }
 
 TEST(ControlTuningStoreTest, AConcurrentReaderNeverObservesAHalfWrittenTuning) {
   // Every published tuning has all six fields set to the same number, so a reader that ever
   // saw a mixture of two publications would fail this assertion while every individual
-  // field still looked plausible — which is exactly the failure a torn read is, and exactly
-  // why the store keeps two slots and never writes the one the reader may be in.
+  // field still looked plausible — which is exactly the failure a torn read is.
+  //
+  // The reader here is the real one, not a copy of the ideal: it holds the value it last
+  // accepted and hands it to load_or(), which is what ControlLoop does with last_tuning_. That
+  // is the contract the store offers — a whole set or the value you had, never a mixture — and
+  // this test is the end-to-end statement of it under a writer publishing back to back, which
+  // is what a host sending `set sp=`, `set kp=`, `set ki=` in one burst does.
   //
   // Versions run 1..999: the setpoint, both limits and the minimum on-time all accept that
   // range, so every version is a publishable tuning and no field is silently at its bound.
   constexpr int32_t kVersions = 999;
 
+  // What the reader must read before the writer may stop. One pass of 999 publications can
+  // finish before a second thread has started at all — that has been observed here, as a run
+  // whose reader reported zero reads — and a run in which the two never overlap tests nothing
+  // about a race. `reads` is the reader's own counter, so the handover waits for the reader's
+  // progress rather than for a sleep, and the overlap is a property of the test rather than of
+  // the scheduler.
+  constexpr int kMinReads = 20000;
+
   ControlTuningStore store;
+
+  // Version 1 is published, and the reader's own value seeded to it, before either thread
+  // starts. That closes the one window in which the compiled-in defaults are the published set:
+  // they are a complete set and the store is constructed holding them, but they are not one of
+  // this test's versions and the check below could not tell them from a mixture. From here on
+  // every even sequence value names a slot holding a version — sequence 0 (slot 0, the
+  // defaults) is never observed again, and the second publication overwrites slot 0.
+  ControlTuning held = tuning_with(1, 1, 1, 1, 1, 1);
+  ASSERT_TRUE(store.publish(held));
+
   std::atomic<bool> stop{false};
   std::atomic<int> mismatches{0};
   std::atomic<int> reads{0};
 
   std::thread writer([&] {
-    for (int32_t version = 1; version <= kVersions; ++version) {
-      ControlTuning tuning;
-      tuning.setpoint_permille = version;
-      tuning.kp_milli = version;
-      tuning.ki_milli = version;
-      tuning.kd_milli = version;
-      tuning.min_on_time_ms = static_cast<uint32_t>(version);
-      tuning.max_duty_permille = version;
-      ASSERT_TRUE(store.publish(tuning));
+    // Cycles the versions and stops once the reader has clearly been running alongside. Every
+    // version is a whole set on its own, so a cycle boundary is not a case the reader can see.
+    int32_t version = 1;
+    while (reads.load(std::memory_order_relaxed) < kMinReads) {
+      store.publish(tuning_with(version, version, version, version,
+                                static_cast<uint32_t>(version), version));
+      version = version == kVersions ? 1 : version + 1;
     }
     stop.store(true, std::memory_order_relaxed);
   });
 
   std::thread reader([&] {
     while (!stop.load(std::memory_order_relaxed)) {
-      const ControlTuning tuning = store.load();
+      held = store.load_or(held);
+      const ControlTuning &tuning = held;
       const bool consistent = tuning.setpoint_permille == tuning.kp_milli &&
                               tuning.kp_milli == tuning.ki_milli &&
                               tuning.ki_milli == tuning.kd_milli &&
@@ -353,8 +503,18 @@ TEST(ControlTuningStoreTest, AConcurrentReaderNeverObservesAHalfWrittenTuning) {
   writer.join();
   reader.join();
 
-  EXPECT_GT(reads.load(), 0);
+  EXPECT_GT(reads.load(), kMinReads);
   EXPECT_EQ(mismatches.load(), 0);
+
+  // And the staleness is not a latch: with the writer gone, the next publication is visible to
+  // the next read, in full. A reader that kept its previous value and never let go would pass
+  // every assertion above and be useless. This one is published from the test thread, so it
+  // cannot collide and the assertion is exact rather than probabilistic.
+  const ControlTuning last = tuning_with(kVersions, kVersions, kVersions, kVersions,
+                                        static_cast<uint32_t>(kVersions), kVersions);
+  ASSERT_TRUE(store.publish(last));
+  held = store.load_or(held);
+  expect_same_tuning(held, last);
 }
 
 // ---------------------------------------------------------------------------
