@@ -259,7 +259,7 @@ static hal_i2c_status_t i2c_transfer(void *ctx, uint16_t addr7, const uint8_t *t
 
   /* Register read: write the command, then a repeated START and read, with no STOP
    * between the two — which is what "write then read" means in hal/i2c.h, and what most
-   * sensors (the SHT31 included) require.
+   * sensors (the AHT20 included) require.
    *
    * The F1 HAL can only express that with the sequential API, which is interrupt driven:
    * the polling API always terminates a frame with a STOP. Each phase is then waited for

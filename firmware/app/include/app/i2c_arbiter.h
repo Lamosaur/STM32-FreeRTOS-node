@@ -1,7 +1,7 @@
 /* i2c_arbiter.h — the single serialisation point for the shared I2C bus (FR-0.2).
  *
  * Every I2C peripheral in this system sits on one bus, and more than one task wants it:
- * the sensor task reads an SHT31 every second while the display task pushes pixels to
+ * the sensor task reads an AHT20 every second while the display task pushes pixels to
  * an SSD1306. Interleaving those two transfers corrupts both, so all access goes
  * through this object, which owns one priority-inheriting mutex.
  *

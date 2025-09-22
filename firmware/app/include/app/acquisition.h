@@ -60,7 +60,7 @@ struct Calibration {
 //
 // A free function rather than a member, so the conversion can be tested directly against
 // values worked out by hand, without a service, a HAL or an RTOS — the same reasoning as
-// Sht31::raw_to_milli_celsius in app/sensor.h.
+// Aht20::raw_to_milli_celsius in app/sensor.h.
 //
 // Polarity: the span is computed as counts_dry - counts_wet, so a probe whose wet reading
 // is *higher* than its dry one (an inverted front end) produces a negative span and the

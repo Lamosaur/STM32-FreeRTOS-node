@@ -1,9 +1,29 @@
 # Design Specification and Requirements Plan
 
 **Project:** STM32 FreeRTOS Sensor & Control Node
-**Revision:** 0.6 (draft)
-**Status:** Phase 0 implemented and host-verified; Phase 1 in progress (host-verifiable
-core); Phases 2-3 planned; Phase 4 deferred
+**Revision:** 0.7 (draft)
+**Status:** Phases 0 and 1 implemented and host-verified; Phases 2-3 planned; Phase 4
+deferred
+
+**Revision 0.7 change:** the document now describes the hardware and the mechanism the
+firmware actually uses. Revision 0.6 got the sensor set wrong and named a tuning-publication
+scheme that did not survive its own test:
+
+- The I2C sensor is an **AHT20 + BMP280** module — AHT20 at 0x38, BMP280 at 0x76 and
+  deliberately unread — not the SHT31 at 0x44 this document assumed. The CRC-8 is the
+  SHT3x's algorithm, which is why that code survived the change; the frame is not, and a
+  driver keeping the old framing would have read zero humidity rather than failing loudly.
+- The controlled variable is a **capacitive** soil-moisture probe v2.0, 3.3 V, and it stays
+  that in the final design. The analog signal path is unchanged by this; the note about a
+  resistive probe's transfer function was about the wrong sensor.
+- Setpoint and gains are published by a **seqlock whose reader never spins**, not by the
+  "atomic swap" revision 0.6 names. The two-slot index swap it described was not atomic and
+  delivered torn tunings under a burst of `set` commands; Section 6.1 decision 9 records the
+  measurement that replaced it.
+- Phase 1's ADC/DMA HAL and actuator output are **written and linked into the image**, so
+  the paragraph below stating that they are not is corrected. The two Phase 1 pieces that
+  genuinely remain unfinished — the step-response export path and the timing service's
+  single-writer restriction — are now named there explicitly.
 
 **Revision 0.6 change:** Phase 1's decisions are settled and recorded in Section 6.1, and
 three statements in Section 6 that those decisions contradict have been corrected rather
@@ -25,16 +45,19 @@ suite now exist, and Section 5.3's open decisions are settled and recorded there
 status statements throughout this document have been corrected accordingly: no longer
 "No code written", but also not "verified on hardware" — see the note below.
 
-**What has not happened.** No board has been brought up, no firmware has been flashed,
-and nothing has been measured with an instrument. Every figure in Section 9 is still
-open except the ones marked host-verified in
-[measurements.md](measurements.md). The evidence for Phases 0 and 1 is evidence about
-logic verified on the host (FR-0.6), not about volts.
+**What has not happened.** No firmware has been flashed to a board, and nothing has been
+measured with an instrument. A board is attached over SWD, has been identified, and its
+flash is confirmed blank (`docs/bring-up-log.md`), but every figure in Section 9 is still
+open except the ones marked host-verified in [measurements.md](measurements.md). The
+evidence for Phases 0 and 1 is evidence about logic verified on the host (FR-0.6), not
+about volts.
 
-Within Phase 1, the acquisition service, the control loop, the tuning store and the
-step-response recorder exist and are host-tested, but the ADC/DMA HAL that feeds them and
-the actuator output that drains them are not written yet — so the Phase 1 code compiles
-for the target without being linked into the image, and none of it has run on silicon.
+Within Phase 1, the acquisition service, the control loop, the tuning store, the
+step-response recorder, the ADC/DMA HAL and the actuator output all exist, are host-tested,
+and are linked into the target image. Two pieces are deliberately incomplete and are named
+here rather than implied: the step-response recorder has no export path to the host, so
+FR-1.5 is not yet satisfied end to end, and the timing service is single-writer, so its
+figures cannot yet reach the host for NFR-1.8 and NFR-1.9. Neither has run on silicon.
 
 **Revision 0.4 change:** the record now states plainly that no implementation exists
 yet. Phase 0 is a design to be built, not an as-built description, and the design
@@ -333,7 +356,7 @@ The design below is implemented in `firmware/` and exercised by the host test su
 | Task | Priority | Period | Responsibility | Shares |
 |------|----------|--------|----------------|--------|
 | Supervisor | 4 | 250 ms | Feeds the watchdog, tracks task heartbeats | — |
-| Sensor | 3 | 1000 ms | Reads the SHT31 over I2C; releases the bus during the conversion | I2C (mutex) |
+| Sensor | 3 | 1000 ms | Reads the AHT20 over I2C; releases the bus during the conversion | I2C (mutex) |
 | Application / control | 3 | 100 ms | Owns application logic and state; target-independent. Becomes the Phase 1 PID loop | — |
 | Comms | 2 | 50 ms | Host link for telemetry and tooling | UART |
 | Display | 1 | 200 ms | Refreshes the OLED over I2C using DMA + dirty rectangles | I2C (mutex) |
@@ -343,7 +366,9 @@ by `tests/test_node.cpp` rather than left to review, so FR-0.1 fails the build i
 regresses.
 
 The IMU named here in revision 0.4 is superseded by decision 9 in Section 5.3: for a
-greenhouse node the I2C sensor is a temperature/humidity device.
+greenhouse node the I2C sensor is a temperature/humidity device, and the one on the bench
+is an AHT20. The controlled quantity is not on this bus at all — it is the capacitive
+probe, read through the Phase 1 ADC path.
 
 The I2C mutex is the single serialisation point for the bus, which is why the
 priority-inheritance property in FR-1.7 matters: the arbiter sits on the critical path
@@ -387,22 +412,34 @@ next to the code that depends on it.
 | 5 | Refresh strategy | Dirty-rectangle partial refresh over the arbiter's DMA path. A bounding box rather than a tile map: O(1) per draw with no allocation, on a 20 KB part. An unchanged screen costs zero bus bytes. | `app/include/app/display.h`, `app/src/node.cpp` |
 | 6 | Host-runnable unit tests | GoogleTest via `FetchContent`, `ctest` driver, ASan and UBSan on by default. The application core compiles against `hal/` and `rtos/` interfaces only, so the same `Node::tick()` runs on the host and on target. | `tests/CMakeLists.txt`, `CMakeLists.txt` |
 | 7 | 72 h unattended run | `hal_system_iface_t::boot_count()` in a backup register is the reset counter; the run is clean if it stays at 1. Runs on hardware — not yet started. | `hal/include/hal/system.h`, `docs/measurements.md` 0-B3/0-B4 |
-| 8 | Sensor set | SHT31 temperature/humidity at 0x44, plus the SSD1306 at 0x3C, both on I2C1. Two devices and two tasks on one bus is what makes FR-0.2 a real requirement rather than a formality; see the note below on the IMU. | `app/board.h` |
+| 8 | Sensor set | The final design's set, and the one on the bench: a **capacitive soil-moisture probe v2.0** (analog, 3.3 V) as the controlled variable on the Phase 1 ADC path; an **AHT20** temperature/humidity sensor at 0x38 as the monitored ambient device; a **BMP280** at 0x76 that answers the bus scan and is deliberately not read; and the **SSD1306** at 0x3C for display. The AHT20 plus the SSD1306 is two devices and two tasks on one bus, which is what makes FR-0.2 a real requirement rather than a formality. | `app/board.h` |
 | 9 | Node purpose | A **greenhouse** node. Soil moisture is the primary quantity and is analog, so it belongs on the Phase 1 timer-triggered ADC path; Phase 0 reads temperature and humidity over I2C. | `app/board.h`, `README.md` |
 
 **Superseded by decision 9:** the Phase 0 table in Section 5.1 lists an IMU as the I2C
 sensor. For a botanical node an IMU is the wrong primary sensor, and the greenhouse
 reading is better served by temperature and humidity. The sensor service is written
-against the SHT31 but the arbiter and supervisor are sensor-agnostic, so adding an IMU
+against the AHT20 but the arbiter and supervisor are sensor-agnostic, so adding an IMU
 later is a new driver rather than a redesign.
+
+**Superseded by the bench module (revision 0.7):** this table was written against an SHT31
+at 0x44, which the attached module turned out not to be. It is an **AHT20 + BMP280**
+combination board, so the driver was replaced with an AHT20 driver. What survived the
+substitution and what did not is worth stating, because the distinction is the whole
+lesson: the CRC-8 is the SHT3x's algorithm — polynomial 0x31, init 0xFF, no reflection, no
+final XOR — so that code was unchanged, while the *frame* is different in a way that fails
+silently. The SHT3x returns six bytes carrying two 16-bit words, each with its own CRC; the
+AHT20 returns seven bytes carrying one 20-bit word pair with a single CRC over the first
+six. A driver that kept the old framing would have read zero humidity and reported a CRC
+mismatch rather than a wrong-looking number, which is why `tests/test_sensor.cpp` now pins
+the AHT20 framing and `docs/bring-up-log.md` records how the substitution was found.
 
 **Still open, and not blocking Phase 0:** the Section 12 questions on the Phase 3 MCU
 choice, the toolchain path, and the board outline size.
 
 ## 6. Phase 1 design — deterministic sensing and control
 
-**Signal path:** soil-moisture probe → op-amp buffer → RC anti-alias filter → ADC
-(timer-triggered, DMA circular half/full-complete interrupts) → double buffer →
+**Signal path:** capacitive soil-moisture probe v2.0 → op-amp buffer → RC anti-alias filter
+→ ADC (timer-triggered, DMA circular half/full-complete interrupts) → double buffer →
 acquisition service → control task (PID, fixed period) → time-proportioned actuator
 switching → gate driver → pump.
 
@@ -412,10 +449,10 @@ switching → gate driver → pump.
   context. This keeps ISR latency (NFR-1.9) defensible.
 - Control period is set by a hardware timer, not `vTaskDelay`, so period accuracy does
   not depend on tick granularity.
-- Setpoint and gains are published by a **snapshot with an atomic swap, not a mutex**,
+- Setpoint and gains are published through a **seqlock whose reader never spins**,
   written by the comms task and read by the control task, so tuning does not require a
-  reflash (FR-1.4). See decision 9 in Section 6.1 for why the mutex that this section
-  originally specified was the wrong choice.
+  reflash (FR-1.4). Section 6.1 decision 9 records why neither the mutex this section
+  originally specified nor the two-slot index swap that replaced it was correct.
 
 **Deliverables:** firmware, host step-response plotter, measured scheduling numbers,
 CI workflow, `docs/measurements.md` with captured figures.
@@ -433,14 +470,14 @@ than this table, so the reasoning lives next to the code that depends on it.
 | Averaging | 100 samples per published value → 10 Hz | `app/board.h`, `app/src/acquisition.cpp` |
 | Anti-alias corner | R = 10 kΩ, C = 150 nF → 106 Hz, one decade below Nyquist | `app/board.h` |
 | Why that corner is not anti-aliasing theatre | A single pole rolls off at −20 dB/decade, so pushing an alias below one LSB would need a corner thousands of times below Nyquist, which would also destroy the signal. The RC provides a defined, sweepable rolloff for what is actually present here (mains harmonics, gate-driver switching). | `app/board.h` |
-| Probe calibration | Two measured points and a line between them, runtime-settable. A resistive probe's transfer function depends on its geometry, supply and soil, so a formula would be a guess dressed as physics. | `app/board.h`, `app/include/app/acquisition.h` |
+| Probe calibration | Two measured points and a line between them, runtime-settable. A capacitive probe's output depends on its geometry, its supply and the soil's dielectric behaviour, so a formula would be a guess dressed as physics — and the two endpoints in `app/board.h` are still placeholders until a probe is measured in air and in water. | `app/board.h`, `app/include/app/acquisition.h` |
 | No polling | Structural, not a convention: `hal_adc_iface_t` has no "conversion ready" and no "read result" entry, so polling cannot be written (FR-1.1) | `hal/include/hal/adc.h` |
 
 #### Control (FR-1.3, FR-1.4, FR-1.5)
 
 | # | Decision | Settled as | Where it lives |
 |---|----------|-----------|----------------|
-| 1 | Controlled variable | **Soil moisture**, from the analog channel. The I2C temperature/humidity sensor stays monitored only — it does not drive the actuator. | `app/src/control.cpp` |
+| 1 | Controlled variable | **Soil moisture**, from the analog channel and the capacitive probe v2.0. The I2C temperature/humidity sensor (AHT20) stays monitored only — it does not drive the actuator. | `app/src/control.cpp` |
 | 2 | Setpoint | 450 permille (45.0 %), runtime-tunable | `app/board.h` (FR-1.4) |
 | 3 | Control period | **1000 ms.** Chosen from the plant, not from the CPU: soil responds over minutes, so a 1 kHz loop would re-decide tens of thousands of times before the process moved, reacting to sensor noise rather than to information. | `app/board.h` |
 | 4 | Output form | **Time-proportioned**: within each window the pump is on for `duty × window`. Actuator-agnostic (works for a DC pump or a solenoid valve, which fast PWM would buzz and wear), physically matched to a slow process, and directly visible on a logic analyzer. FR-1.3's "PWM actuator output" is satisfied by this: it is pulse-width modulation at the window rate. | `app/src/control.cpp` |
@@ -448,7 +485,7 @@ than this table, so the reasoning lives next to the code that depends on it.
 | 6 | Maximum duty | **500 permille** per window — a bound while tuning, and the integral clamp reference | `app/board.h` |
 | 7 | Loop type | **PID with `kd` defaulted to 0**, integral clamped. D acts on the rate of change of a slow, noisy reading, which is mostly noise: the measured consequence is quantified in the test that evidences this decision. | `app/src/control.cpp`, `tests/test_control.cpp` |
 | 8 | Fail-safe | An absent or stale reading forces the output to **0**, integral held rather than unwound. New in Phase 1: "not acting" now has physical meaning, and a lost probe must stop the pump rather than hold its last duty. The watchdog covers a hung CPU, **not** a MOSFET stuck on, so the gate needs a hardware pull-down. | `hal/include/hal/actuator.h`, `app/src/control.cpp` |
-| 9 | Gains publication | **Snapshot + atomic swap, never a mutex.** A mutex here would put a lock acquisition inside the very loop whose jitter NFR-1.8 measures, and would itself be the priority-inversion case FR-1.7 exists to measure. | `app/include/app/control.h` |
+| 9 | Gains publication | **A seqlock whose reader never spins**, never a mutex. A mutex here would put a lock acquisition inside the very loop whose jitter NFR-1.8 measures, and would itself be the priority-inversion case FR-1.7 exists to measure. The writer marks the slot odd, writes the fields, then marks it even; a reader that observes an odd or changed sequence **discards the value and keeps its previous one**. The reader must not retry: the control task outranks the comms task and there is one core, so a spinning reader would wait for a writer that cannot be scheduled — a livelock, not a wait. This replaced a two-slot index swap that *looked* atomic and was not: it delivered torn tunings at a measured 227 reads in 72,521, mixing fields from up to six publications apart into a plausible-looking set nobody had ever sent. | `app/include/app/control.h`, `tests/test_control.cpp` |
 | 10 | 1 kHz | **Not** the control period. If that figure is wanted it is a separate, explicitly labelled scheduling test — presenting it as a control requirement would be the measurement plan flattering itself. | — |
 
 **Integral clamp — what "clamped" means, because the wording was ambiguous.** Decision 7

@@ -103,7 +103,7 @@ instrument and the method are decided before the work starts, which is what keep
 
 | # | Figure | Value | Instrument / method | Requirement |
 |---|--------|-------|---------------------|-------------|
-| 1-1 | Control-loop period and jitter | ___ us | GPIO toggle at control-task entry, logic analyzer | NFR-1.8 |
+| 1-1 | Control-loop period and jitter | ___ us | GPIO edges **at the control evaluation itself** (or a DWT cycle-counter delta between the same two points), logic analyzer | NFR-1.8 |
 | 1-2 | Worst-case ISR-to-task latency | ___ us | GPIO in the DMA-complete ISR and at task entry | NFR-1.9 |
 | 1-3 | CPU utilisation | ___ % | `vTaskGetRunTimeStats()`, must stay under 60 % | NFR-1.10 |
 | 1-4 | Per-task stack headroom | ___ % | `uxTaskGetStackHighWaterMark()` | NFR-1.11 |
@@ -112,6 +112,35 @@ instrument and the method are decided before the work starts, which is what keep
 | 1-7 | Anti-alias corner frequency | ___ Hz | Function-generator sweep, scope amplitude per point | FR-1.2 |
 | 1-8 | Step response: rise, overshoot, settling | ___ / ___ / ___ | Host plot from exported samples | FR-1.3, FR-1.5 |
 | 1-9 | Priority-inversion comparison | ___ | Instrumented run, mutex versus binary semaphore | FR-1.7 |
+
+### 1-1 in more detail, because the obvious method measures the wrong thing
+
+NFR-1.8 names the **control-loop period**, which is 1000 ms and is *not* the app task's
+period. The app task runs every 25 ms so that the actuator gate's rising and falling edges
+land within 25 ms of where the time-proportioned schedule puts them; the control decision
+itself is taken on every tenth acquisition block, which is one second of TIM3's hardware
+trigger. A GPIO toggled at task *entry* would therefore report a 25 ms cadence with 25 ms
+of jitter, and reporting that as the control-loop figure would be wrong by a factor of
+forty while looking entirely reasonable on a scope.
+
+So the edges have to be placed at the control evaluation, not at task entry. Either toggle
+a spare pin immediately before and after `ControlLoop::update()`, or better, timestamp with
+the DWT cycle counter at those two points and report the difference against 1000 ms — the
+cycle counter gives a number without needing a second channel on the analyzer. Toggling a
+pin has the advantage of being visible next to the actuator waveform on PA1, which is how
+the gate timing is checked at the same time.
+
+### Rows currently blocked
+
+Two Phase 1 rows cannot be filled in yet, and the reason is in the firmware rather than the
+bench:
+
+- **1-1 and 1-2** are measured into `TimingService`, which is single-writer: the task that
+  timestamps also owns the histogram, and the comms task cannot read it. The figures need a
+  handover buffer before they can leave the board.
+- **1-8** needs the step-response samples exported. `StepCapture` records them and
+  `host/step_response.py` can analyse them, but nothing currently arms the capture or sends
+  the samples, so the two ends of FR-1.5 are not yet joined.
 
 ### 1-9 in more detail
 
