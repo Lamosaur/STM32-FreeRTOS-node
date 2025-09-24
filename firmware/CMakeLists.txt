@@ -71,6 +71,15 @@ if(CMAKE_CROSSCOMPILING)
     -Wl,--print-memory-usage
     -nostartfiles
     -specs=nano.specs -specs=nosys.specs)
+
+  # The script above is passed through target_link_options, which CMake does *not* treat as a
+  # dependency of the link: editing the script left the executable stale until some unrelated
+  # change forced a relink. That is exactly how a wrong _estack survived in this tree —
+  # the fix was written, built, and silently not linked. LINK_DEPENDS puts the script in the
+  # link rule's dependency list, so changing it relinks the image.
+  set_target_properties(firmware.elf PROPERTIES
+    LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/stm32f103c8t6.ld)
+
   # No SUFFIX is set: on a Generic system CMake appends none, and the target name
   # already carries the .elf, so setting one produced firmware.elf.elf.
 

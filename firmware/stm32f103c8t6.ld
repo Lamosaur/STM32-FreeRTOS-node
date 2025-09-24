@@ -46,9 +46,6 @@
 /* Entry Point */
 ENTRY(Reset_Handler)
 
-/* Highest address of the user mode stack */
-_estack = 0x20004FFF;    /* end of RAM */
-
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
@@ -59,6 +56,32 @@ MEMORY
 FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 64K
 RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 20K
 }
+
+/* Highest address of the user mode stack: one past the last byte of RAM, because the stack
+ * is full-descending and the first push writes *below* this address.
+ *
+ * Derived from the MEMORY block above rather than written out, because the value this file
+ * inherited from ST's own F103xB script was wrong and nothing caught it. That script pairs
+ *
+ *   _estack = 0x20004FFF;           (its comment reads "end of RAM")
+ *
+ * with
+ *
+ *   RAM (xrw) : ORIGIN = 0x20000000, LENGTH = 20K
+ *
+ * and 0x20000000 + 20K is 0x20005000, not 0x20004FFF. The inherited value is the address of
+ * the last *byte* of RAM, which leaves the initial MSP odd: not even word-aligned, and
+ * ARMv7-M requires word alignment for the load/store-multiple instructions every function
+ * prologue uses. Whether this particular die tolerates that is not worth discovering on a
+ * device that has to run unattended for 72 h (NFR-0.7) — and an odd initial stack pointer
+ * is wrong on the ABI's terms regardless of what one chip does with it. Expressing the value
+ * as an expression over the region makes the two impossible to disagree.
+ *
+ * This does not move any code or data: it changes the stack's top by one byte, and the
+ * reserved-heap-and-stack section below is sized by _Min_Heap_Size and _Min_Stack_Size
+ * rather than by this address.
+ */
+_estack = ORIGIN(RAM) + LENGTH(RAM);
 
 /* Define output sections */
 SECTIONS
