@@ -206,6 +206,18 @@ TEST_F(ArbiterTest, ConcurrentTasksNeverOverlapOnTheBus) {
   // Make each transfer take real time so a missing mutex would actually collide.
   bus.set_transfer_delay_us(50);
 
+  // The fixture's arbiter carries the production 50 ms lock timeout. On a host that is
+  // compiling while the tests run, the OS can deschedule a waiting thread for longer
+  // than that, and one spurious timeout would fail this test for the wrong reason: it
+  // would be measuring the host scheduler's worst-case latency rather than whether the
+  // arbiter serialises the bus. This test's question is mutual exclusion under
+  // contention, so it uses its own arbiter with a timeout long enough that only a
+  // genuinely wedged lock could trip it. The production timeout itself is exercised by
+  // the dedicated timeout tests.
+  ArbiterConfig stress_config;
+  stress_config.lock_timeout_ms = 5000;
+  I2cArbiter stress_arbiter{bus.iface(), rtos.iface(), &recovery, stress_config};
+
   // Start every thread on the same transfer, so contention is guaranteed rather than
   // hoped for. Without this the test could pass by luck.
   std::atomic<int> ready{0};
@@ -225,7 +237,7 @@ TEST_F(ArbiterTest, ConcurrentTasksNeverOverlapOnTheBus) {
       const uint16_t addr = (t % 2 == 0) ? kAddrAht20 : kAddrSsd1306;
       for (int i = 0; i < kTransfersPerThread; ++i) {
         uint8_t payload = static_cast<uint8_t>(i);
-        if (arbiter.write(addr, &payload, 1) != BusResult::Ok) {
+        if (stress_arbiter.write(addr, &payload, 1) != BusResult::Ok) {
           failures.fetch_add(1);
         }
       }
@@ -235,7 +247,7 @@ TEST_F(ArbiterTest, ConcurrentTasksNeverOverlapOnTheBus) {
     worker.join();
   }
 
-  const ArbiterStats stats = arbiter.stats();
+  const ArbiterStats stats = stress_arbiter.stats();
 
   // The pass condition FR-0.2 states: no contention faults.
   EXPECT_EQ(failures.load(), 0);
@@ -250,7 +262,21 @@ TEST_F(ArbiterTest, ConcurrentTasksNeverOverlapOnTheBus) {
   // The witness that this was a stress test at all. If contention is zero the test
   // proved nothing, because the threads never actually competed.
   EXPECT_GT(rtos.total_contentions(), 0);
-  EXPECT_EQ(stats.contended, static_cast<uint32_t>(rtos.total_contentions()));
+
+  // The two contention counters agree through a sum, not an equality. The arbiter's
+  // `contended` counts a *successful* acquisition that blocked; the RTOS double's
+  // `total_contentions` counts every attempt that found the mutex held, including one
+  // that then timed out. A timed-out attempt is therefore counted by the double and by
+  // the arbiter's `lock_timeouts`, and by nothing else, so
+  //
+  //   total_contentions == contended + lock_timeouts
+  //
+  // is the invariant. The fixture's former `contended == total_contentions` held when
+  // nothing timed out and silently stopped being true the first time a run produced a
+  // timeout mid-stress — which is exactly the failure this assertion now documents
+  // rather than hides.
+  EXPECT_EQ(stats.contended + stats.lock_timeouts,
+            static_cast<uint32_t>(rtos.total_contentions()));
 
   // Mutex discipline: never two holders, always balanced.
   EXPECT_EQ(rtos.max_mutex_depth(), 1);
