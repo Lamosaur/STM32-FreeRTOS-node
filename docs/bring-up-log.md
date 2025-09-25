@@ -207,3 +207,88 @@ debugger attached (debug power and clock gating both distort sleep current).
 **Result:**
 **Open:** which peripherals remain clocked or unpowered in each mode
 **Follow-up:**
+
+---
+
+## Dev board (Blue Pill) over SWD — first contact
+
+### 2025-09-20 — Identification, flash budget, and the bootloader trap
+
+**Goal:** identify the attached Blue Pill over the ST-Link, establish how much flash this
+part really has (Phase 2's bootloader layout depends on it), flash the Phase 0/1 image,
+and verify it boots.
+
+**Setup:** Blue Pill labelled F103C8T6, ST-LINK/V2 (firmware V2J37S7, serial
+37FF71064E573436F6981443) on the 4-wire SWD header (3V3, SWDIO, SWCLK, GND). **No NRST
+line is connected.** Tools: `st-flash` 1.8.0, `st-util`, `gdb` 17.2. Firmware: HEAD
+`17724c0` (after the `_estack` fix). The sandbox masqueraded `/dev/bus/usb`; with the
+real device exposed the ST-Link works normally.
+
+**Observations:**
+
+- `st-info`: flash 131072 (1 KiB pages), SRAM 20480, chipid `0x410` (STM32F1xx medium
+  density), dev-type STM32F1xx_MD. The part is labelled C8T6 (rated 64 KB) but reports
+  **128 KB**.
+- `F_SIZE` @ `0x1FFFF7E0` = `0x0080` (128 KB). The unique-ID tail reads ASCII `2RKA86`.
+- Upper flash is **real, not aliased**: wrote 1024 bytes of pattern at `0x0801FC00`
+  (above the 64K mark), read back 1024/1024 identical, and a control read at
+  `0x0800FC00` (the mirrored location, had it aliased) stayed `0xFF`. Page erased after.
+  So this board genuinely has 128 KB of working flash — consistent with ST's own
+  F103xB linker script, which declares `FLASH LENGTH = 128K` for the same die.
+- Board flash was completely blank on arrival.
+- **`_estack` bug, found and fixed this session:** the shipped image's initial MSP was
+  `0x20004FFF` — odd, inherited verbatim from ST's own `STM32F103XB_FLASH.ld`. The
+  project script now derives `_estack = ORIGIN(RAM) + LENGTH(RAM)` = `0x20005000`, and
+  the script is registered as a link dependency so the fix cannot silently not relink
+  again. Image size unchanged (42364 B).
+- Flashing works every time ("Flash written and verified"). Because NRST is not
+  connected, `st-flash` resets via AIRCR software reset; `--connect-under-reset` is
+  unavailable.
+- **Reading RCC registers through `st-flash` is not meaningful.** The ST-Link loads a
+  flash loader into SRAM that reconfigures the clock tree while it runs; `RCC_CR` /
+  `RCC_CFGR` read back the *loader's* state (a PLL configuration matching neither the
+  firmware's HSE nor its HSI fallback path). Lesson: do not infer the firmware's clock
+  state from `st-flash` reads.
+- **The BKP backup registers are a trustworthy read channel and a boot detector.**
+  The loader does not touch them; a 280-byte probe image wrote `0x1357`/`0xB007` to
+  `BKP_DR1`/`DR2` and they read back exactly and persist across resets. The real
+  firmware increments `BKP_DR1` on every boot (`count_boot()`), so a steady DR1 across
+  resets means the firmware never ran.
+- `CFSR`/`HFSR` = 0: the part has never hard-faulted. `DFSR` bit 24 (HALTED) is set by
+  the debug halt itself, not by a fault.
+- **Boot problem:** after flashing the real firmware, 3/3 software resets put the CPU
+  in the ST factory bootloader — PC `0x1FFFF3BE` polling USART1, with the system-memory
+  vector table at `0x1FFFF000` (`SP 0x200001FC`, reset `0x1FFFF765`). Flash contents are
+  correct (`SP=0x20005000`, `PC=0x080064C9`) and verify every time; the CPU simply never
+  executes them. The probe image booted from flash exactly once (the `0x1357` write).
+- Method: `st-util -n -m -p 4242` + `gdb` reads CPU state through the debug interface
+  directly, which is *not* loader-contaminated — that is how the bootloader PC was seen.
+
+**Hypothesis:** BOOT0 is floating or not firmly strapped, so the sampled value differs
+across resets; most resets sample high and enter the system bootloader. A hard-strapped
+jumper could not be inconsistent the way this board is (1 flash-boot out of 4 resets).
+
+**Changes:** none yet — the jumper is on the user's bench, not reachable from here.
+
+**Result:** unresolved until the user acts.
+
+**Open:**
+
+- **User action required:** set BOOT0 (Blue Pill jumper JP1) firmly to the "0"
+  position. After that, any reset should boot the application.
+- HSE start has never been observed. The banner will report "HSE+PLL" or "HSI fallback
+  (crystal did not start)" over USART1 (115200 8N1, PA9/PA10). The ST-LINK/V2 has no VCP,
+  so a USB-UART adapter (or the logic analyzer's UART decoder on PA9) is needed to read it.
+- `RCC_CSR` reads `0x1C` (bits 2-4) where the ST F1 layout defines those bits as
+  reserved. Combined with the 128 KB F_SIZE and the ASCII UID tail, this part presents
+  clone characteristics. Recorded so nobody relies on undocumented register bits, but
+  nothing needs them so far.
+
+**Follow-up:**
+
+1. User sets BOOT0 to 0; re-flash or reset; expect the boot banner and, from it, the
+   HSI/HSE verdict.
+2. If the crystal does not start, that is the designed fallback — proceed; the 72 MHz
+   timing constants simply do not apply until it does.
+3. Then the first on-board tests: FR-0.3 (hold SDA low, `recover`, count 9 SCL pulses +
+   1 STOP) and the Phase 1 ADC path with the capacitive probe connected.

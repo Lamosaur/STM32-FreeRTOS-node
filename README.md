@@ -10,11 +10,14 @@ service, the DMA dirty-rectangle display path, the timer-triggered ADC acquisiti
 the PID control loop with its runtime tuning store, and the host test suite all exist and
 pass. The target build produces a flashable image for an STM32F103C8T6.
 
-**Nothing has been measured with an instrument.** A board is attached and identified over
-SWD, and its flash has been confirmed blank — the details are in
-[docs/bring-up-log.md](docs/bring-up-log.md) — but no firmware has been run on it and
-every electrical figure in the measurement plan is still open. The evidence so far is
-evidence about logic under a host test suite, not about silicon — see
+**Nothing has been measured with an instrument.** A Blue Pill is attached and identified
+over SWD, its flash has been measured at 128 KB (the part is label- C8T6 but reports and
+withstands 128 KB), and a firmware image is flashed and verified in place — but the board
+will not boot it yet: BOOT0 is not strapped low, so the chip enters the ST factory
+bootloader instead of the application. The details are in
+[docs/bring-up-log.md](docs/bring-up-log.md). Moving the BOOT0 jumper to "0" should let
+the app run; until then every electrical figure in the measurement plan is still open,
+and the evidence so far is about logic under a host test suite, not about silicon — see
 [What is and is not established](#what-is-and-is-not-established).
 
 Requirements, phase plan, and design detail live in **[docs/design-spec.md](docs/design-spec.md)**.
@@ -227,10 +230,15 @@ Stated plainly, because the difference matters when someone reads a claim later.
 - The control loop holds its period, clamps its integral, refuses to act on a stale
   reading, and never delivers a partially-updated set of gains under concurrent writes.
 
-**Not established, because no firmware has run on the board yet:**
+**Not established, because the board does not boot the flashed image yet:**
 
+- The app itself: flash is verified in place, but BOOT0 not being strapped low sends
+  every reset into the ST factory bootloader. Until the jumper is moved to "0", nothing
+  the firmware does on a reset can be observed.
 - Anything electrical. No rail has been measured, no scope capture exists, and the
   anti-alias filter is a set of component values.
+- Whether the HSE crystal starts; the clock banner will report the HSI fallback if it
+  does not, and the firmware is designed to run on either.
 - The nine-clock release as a waveform, and whether the peripheral comes back cleanly
   on the real silicon.
 - The timer-triggered ADC at all: whether TIM3's 1 kHz trigger, the DMA double buffer and
