@@ -38,6 +38,7 @@ add_executable(node_tests
   test_acquisition.cpp
   test_control.cpp
   test_timing.cpp
+  test_timing_handover.cpp
   test_step_capture.cpp
   test_comms.cpp
   test_display.cpp

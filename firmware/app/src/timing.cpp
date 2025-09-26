@@ -249,4 +249,40 @@ size_t TimingService::report(char *out, size_t capacity) const {
   return used;
 }
 
+bool TimingReportHandover::publish(const TimingService &service, bool window_complete) {
+  if (ready_.load(std::memory_order_acquire)) {
+    // A report the reader has not consumed is not overwritten: the protocol in the header
+    // is that the buffer is only written while nothing is outstanding.
+    return false;
+  }
+  length_ = static_cast<uint32_t>(service.report(buffer_, kCapacity));
+  window_complete_ = window_complete;
+  ready_.store(true, std::memory_order_release);
+  return true;
+}
+
+bool TimingReportHandover::take_reset() {
+  return reset_pending_.exchange(false, std::memory_order_acq_rel);
+}
+
+bool TimingReportHandover::take_request() {
+  return requested_.exchange(false, std::memory_order_acq_rel);
+}
+
+void TimingReportHandover::request() {
+  requested_.store(true, std::memory_order_release);
+}
+
+void TimingReportHandover::consume() {
+  // Read the "was it a full window" bit *before* clearing ready_: the writer may begin a
+  // new publication the moment ready_ goes false, and that publication would overwrite
+  // window_complete_. Storing false after the read makes the read happen-before any such
+  // write.
+  const bool complete = window_complete_;
+  ready_.store(false, std::memory_order_release);
+  if (complete) {
+    reset_pending_.store(true, std::memory_order_release);
+  }
+}
+
 } // namespace node

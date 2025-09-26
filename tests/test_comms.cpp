@@ -15,6 +15,7 @@
 #include "app/control.h"
 #include "app/i2c_arbiter.h"
 #include "app/i2c_recovery.h"
+#include "app/timing.h"
 #include "support/fake_i2c.h"
 #include "support/fake_peripherals.h"
 #include "support/fake_rtos.h"
@@ -95,6 +96,7 @@ class CommsTest : public ::testing::Test {
     sources.sensor = &sensor;
     sources.identity = &identity;
     sources.tuning = &tuning_store;
+    sources.timing = &timing_handover;
     service = std::make_unique<CommsService>(uart.iface(), &arbiter, rtos.iface(), sources);
   }
 
@@ -106,6 +108,7 @@ class CommsTest : public ::testing::Test {
   I2cArbiter arbiter{bus.iface(), rtos.iface(), &recovery};
   SensorService sensor{&arbiter, rtos.iface()};
   ControlTuningStore tuning_store;
+  TimingReportHandover timing_handover;
   NodeIdentity identity;
   CommsSources sources;
   std::unique_ptr<CommsService> service;
@@ -253,6 +256,50 @@ TEST_F(CommsTest, SetChangesEveryFieldWithoutAReflash) {
   const std::string out = uart.transmitted();
   EXPECT_NE(out.find("set sp=30.00 ok"), std::string::npos);
   EXPECT_NE(out.find("set min=60 ok"), std::string::npos);
+}
+
+TEST_F(CommsTest, TimingCommandSendsAPublishedReportAndConsumesIt) {
+  TimingService timing;
+  timing.note_period_us(1'000'000);
+  timing.note_period_us(1'000'000);
+  timing.note_period_us(1'000'000);
+  ASSERT_TRUE(timing_handover.publish(timing, /*window_complete=*/false));
+
+  ASSERT_TRUE(service->handle_command("timing"));
+
+  const std::string out = uart.transmitted();
+  EXPECT_NE(out.find("period us: n=3 min=1000000 max=1000000 mean=1000000 sd=0"),
+            std::string::npos);
+  EXPECT_EQ(service->stats().unknown_commands, 0u);
+  // The published report was sent, so the handover is empty again and the writer can
+  // start the next publication.
+  EXPECT_FALSE(timing_handover.ready());
+  EXPECT_FALSE(timing_handover.window_complete());
+}
+
+TEST_F(CommsTest, TimingCommandRequestsWhenNothingIsPublished) {
+  ASSERT_TRUE(service->handle_command("timing"));
+
+  EXPECT_NE(uart.transmitted().find("timing: report pending"), std::string::npos);
+  // The app task's view: a request is waiting to be serviced on its next tick.
+  EXPECT_TRUE(timing_handover.take_request());
+  EXPECT_FALSE(timing_handover.take_request());
+  EXPECT_FALSE(timing_handover.ready());
+}
+
+TEST_F(CommsTest, TimingCommandServicesARequestOnTheNextPoll) {
+  // The full loop as the two tasks would run it: the host asks, this task forwards the
+  // request, the app task publishes on its next tick, and the next `timing` sends it.
+  ASSERT_TRUE(service->handle_command("timing"));      // -> request()
+  ASSERT_TRUE(timing_handover.take_request());         // the app task's next tick
+  TimingService timing;
+  timing.note_period_us(1'000'000);
+  ASSERT_TRUE(timing_handover.publish(timing, false)); // the app task publishes
+
+  uart.clear_transmitted();
+  ASSERT_TRUE(service->handle_command("timing"));
+  EXPECT_NE(uart.transmitted().find("period us: n=1"), std::string::npos);
+  EXPECT_FALSE(timing_handover.ready());               // sent and consumed
 }
 
 TEST_F(CommsTest, ARefusedSetIsReportedAndLeavesTheTuningAlone) {

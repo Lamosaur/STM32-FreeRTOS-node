@@ -1,5 +1,9 @@
 #include "app/comms.h"
 
+// The full definition of TimingReportHandover: this task is the handover's reader, so it
+// calls buffer()/length()/consume(), none of which exist on the forward declaration.
+#include "app/timing.h"
+
 #include <cstring>
 
 namespace node {
@@ -448,6 +452,47 @@ void CommsService::send_tuning() {
   send_line(line.c_str());
 }
 
+void CommsService::send_timing() {
+  if (sources_.timing == nullptr) {
+    // Same refusal style as `get`: report the absence rather than invent figures.
+    send_line("timing unsupported");
+    return;
+  }
+
+  if (sources_.timing->ready()) {
+    // A publication is waiting: send it and acknowledge it in the same command, so the
+    // writer can start the next window. The report is newline-separated and every line
+    // fits the 128-byte line budget (TimingService::format_line guarantees it), so each
+    // fragment below is exactly one sendable line.
+    const char *report = sources_.timing->buffer();
+    const size_t length = sources_.timing->length();
+    char buffer[kLineCapacity];
+    size_t start = 0;
+    while (start < length) {
+      size_t end = start;
+      while (end < length && report[end] != '\n') {
+        ++end;
+      }
+      const size_t n = end - start;
+      if (n > 0 && n < sizeof(buffer)) {
+        std::memcpy(buffer, report + start, n);
+        buffer[n] = '\0';
+        (void)send_line(buffer);
+      }
+      start = end + 1U; // Skip the newline; the next pass starts at the next line.
+    }
+    sources_.timing->consume();
+    return;
+  }
+
+  // Nothing published yet: ask the app task to format the series as it stands. The
+  // report arrives on a later poll (one app tick to format, then this task's next
+  // 50 ms tick to send it), which "pending" says plainly rather than pretending the
+  // numbers are here.
+  sources_.timing->request();
+  send_line("timing: report pending");
+}
+
 bool CommsService::handle_set(const char *argument) {
   char buffer[kLineCapacity];
 
@@ -615,8 +660,13 @@ bool CommsService::handle_command(const char *line) {
     return true;
   }
 
+  if (std::strcmp(line, "timing") == 0) {
+    send_timing();
+    return true;
+  }
+
   if (std::strcmp(line, "help") == 0) {
-    send_line("cmd ver | stat | get | set <k=v> | recover | help");
+    send_line("cmd ver | stat | get | set <k=v> | recover | timing | help");
     return true;
   }
 

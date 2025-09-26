@@ -308,10 +308,12 @@ class Node {
   // answers "is there a clock?", so no caller has to ask twice.
   uint32_t now_us() const;
 
-  // Report and re-arm the NFR-1.8/NFR-1.9 windows when one fills. See the note in node.cpp:
-  // the series is bounded so its arithmetic stays exact, and nothing pulls it off the board
-  // yet, so a full window is counted and reset rather than silently ignored.
-  void note_timing_window();
+  // The writer's side of the NFR-1.8/NFR-1.9 report handover, run once per app tick:
+  // reset the series when the reader consumed a complete window, then publish either the
+  // snapshot a `timing` request asked for or the window itself if it has filled. Runs
+  // before the note_* calls in the same tick so a reset is in force before the first
+  // sample of the new window lands.
+  void service_timing_handover();
 
   // Draw the status screen if anything it shows has changed. Returns true if a flush
   // was attempted.
@@ -357,11 +359,15 @@ class Node {
   //                comms task writes it (FR-1.4).
   //   control_     borrows tuning_ and must be declared after it.
   //   timing_      is fed by the app task alone (NFR-1.8, NFR-1.9).
+  //   timing_handover_  carries the formatted report to the comms task, the one route
+  //                NFR-1.8/1.9 figures take off the board. Declared before comms_, which
+  //                borrows its pointer in the constructor.
   AdcIsrStamp adc_stamp_{};
   AcquisitionService acquisition_;
   ControlTuningStore tuning_{};
   ControlLoop control_;
   TimingService timing_{};
+  TimingReportHandover timing_handover_{};
 
   // The panel and its canvas are declared before the comms service because the comms
   // service reports the display's byte counters, so it holds a pointer into them.

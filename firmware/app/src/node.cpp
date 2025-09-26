@@ -31,7 +31,8 @@ Node::Node(const NodeHardware &hardware)
       display_{&arbiter_},
       comms_(hw_.uart, &arbiter_, hw_.rtos,
              CommsSources{&sensor_, &supervisor_, &arbiter_, hw_.system,
-                          &display_.stats(), &identity_, &tuning_, &acquisition_, &control_}) {
+                          &display_.stats(), &identity_, &tuning_, &acquisition_,
+                          &control_, &timing_handover_}) {
   // The ISR-side stamping wrapper is bound here, in the constructor, rather than in init():
   // the acquisition service was handed `adc_stamp_.iface()` in the member-initialiser list
   // above, so the forwardee has to be in place before anything can call start(). A null
@@ -196,6 +197,12 @@ void Node::tick_app() {
   // controlled variable).
   app_.evaluations++;
 
+  // The handover's writer side, first in the tick so that a reset (a consumed complete
+  // window) is in force before any new sample of the next window lands below, and a
+  // `timing` request is serviced before the series changes again. See timing.h for the
+  // protocol; this is the only place the handover's writer functions are called.
+  service_timing_handover();
+
   const SensorSnapshot ambient = sensor_.snapshot();
   app_.last_reading = ambient;
 
@@ -254,7 +261,6 @@ void Node::tick_app() {
       // possible at most once in 71 minutes and is counted in the series' oversized
       // samples rather than folded into the mean as if it were a real latency.
       timing_.note_latency_us(us - adc_stamp_.last_stamp_us());
-      note_timing_window();
     }
   }
 
@@ -322,7 +328,6 @@ void Node::recompute_control(uint32_t now_ms, uint32_t now_us_value,
   // 1 kHz trigger is really 1 kHz.
   if (hw_.clock != nullptr && have_last_control_us_) {
     timing_.note_period_us(now_us_value - last_control_us_);
-    note_timing_window();
   }
   last_control_us_ = now_us_value;
   have_last_control_us_ = true;
@@ -383,16 +388,30 @@ uint32_t Node::now_us() const {
   return hw_.clock->now_us(hw_.clock->ctx);
 }
 
-void Node::note_timing_window() {
-  // The timing service ignores samples once its window is full and says so, so a caller
-  // that never reports never notices it has lost the data. Nothing in Phase 1 pulls the
-  // series off the board yet (see the report on the interface gap), so what this can do is
-  // count the completed windows and reset, keeping the measurement running — a node that
-  // silently stopped recording after 17 minutes would make NFR-1.8's "measured, not
-  // assumed" true only for the first 17 minutes of the run.
-  if (timing_.full()) {
-    stats_.timing_windows++;
+void Node::service_timing_handover() {
+  // The writer's side of the report handover (timing.h documents the protocol in full).
+  // Order inside the tick:
+  //
+  //   1. If the comms task consumed a complete-window report, it armed the reset: the
+  //      series is reset here, by the task that owns it, so the next window starts
+  //      accumulating. A window that completes while nobody reads it is *not* silently
+  //      discarded — it waits, published, until a `timing` command consumes it, which is
+  //      the difference between this and the old "count it and drop it".
+  //   2. If no publication is outstanding, publish: either because the series just filled
+  //      (window_complete, counted), or because the comms task asked for a snapshot. The
+  //      request bit is consumed first so that a request arriving against an already-full
+  //      series still yields the complete-window report, not a second, partial one.
+  if (timing_handover_.take_reset()) {
     timing_.reset();
+  }
+  if (!timing_handover_.ready()) {
+    const bool complete = timing_.full();
+    if (timing_handover_.take_request() || complete) {
+      if (complete) {
+        stats_.timing_windows++;
+      }
+      (void)timing_handover_.publish(timing_, complete);
+    }
   }
 }
 

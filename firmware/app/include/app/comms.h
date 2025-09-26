@@ -87,6 +87,12 @@ struct CommsStats {
   uint32_t tuning_refusals = 0;  // `set` commands refused, for any reason
 };
 
+// Forward declaration: CommsSources holds only a pointer to the timing handover, and
+// timing.h (which includes this header for the line-buffer constants) needs this file,
+// so comms.h must not include timing.h in return. The full definition is available to
+// any TU that includes both headers.
+class TimingReportHandover;
+
 struct CommsSources {
   const SensorService *sensor = nullptr;
   const Supervisor *supervisor = nullptr;
@@ -112,13 +118,18 @@ struct CommsSources {
   // wiring is doing something" (which needs a number, and which on a bench is the first
   // question asked of a node whose pump is not running).
   //
-  // The timing service is deliberately NOT here. It is single-writer by design (its header
-  // explains why: a lock on the sample path would perturb the jitter it measures), so a
-  // report from this task would be a race against the control task. Getting NFR-1.8's
-  // numbers off the board needs the app task to format them into a handover buffer, which
-  // is a change to that class rather than to this source list.
+  // The timing report (NFR-1.8/1.9). Appended after `control` for the same reason as the
+  // other Phase 1 sources, and unlike them it is a handover rather than a live object:
+  // TimingService is single-writer by design (its header explains why a lock on the sample
+  // path would perturb the jitter it measures), so the app task formats the report into
+  // this buffer and this task only reads what is handed over. Not const, for the same
+  // reason `tuning` above is not: this task is the handover's *reader*, and reading means
+  // writing the protocol bits — request(), consume() — that make the writer hand the next
+  // report over. The sooner a publication is consumed, the sooner the writer can start the
+  // next window; a report never read simply waits. See TimingReportHandover.
   const AcquisitionService *acquisition = nullptr;
   const ControlLoop *control = nullptr;
+  TimingReportHandover *timing = nullptr;
 };
 
 class CommsService {
@@ -160,6 +171,10 @@ class CommsService {
   // The `get` command: the published tuning, in the units `set` accepts, so that what a host
   // reads back is a line it can send again unchanged.
   void send_tuning();
+
+  // The `timing` command: the NFR-1.8/NFR-1.9 report. Sends the published report if one is
+  // waiting, or asks the app task to format one and says so.
+  void send_timing();
 
   // The `set` command, with `argument` pointing at the text after "set ". Returns true
   // (the verb was understood) whether the value was accepted or refused: a refusal is

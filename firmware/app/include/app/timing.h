@@ -29,6 +29,7 @@
 #ifndef APP_TIMING_H
 #define APP_TIMING_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -197,6 +198,113 @@ class TimingService {
   uint32_t nominal_period_us_;
   TimingSeries period_;
   TimingSeries latency_;
+};
+
+// ---------------------------------------------------------------------------
+// The handover
+// ---------------------------------------------------------------------------
+
+// A single-writer/single-reader handover for the report *text*, which is what lets the
+// comms task send the NFR-1.8/NFR-1.9 figures that the app task measured. It exists
+// because TimingService is single-writer by design (its header explains why the sample
+// path cannot take a lock), so a report from another task has to be a formatted buffer
+// that is handed over, not a shared series — see the note in comms.h's source list.
+//
+// Why this shape. The alternative to a lock is a buffer the two tasks pass back and
+// forth, and the discipline that makes a plain buffer safe there is strict alternation:
+// the writer (the app task) fills the buffer only while no publication is outstanding,
+// and the reader (the comms task) reads it only while one is. Three single bits carry
+// the protocol:
+//
+//   requested_        reader -> writer: "format the series as it stands"
+//   ready_            writer -> reader: "a report is waiting"
+//   reset_pending_    reader -> writer: "the report you published was a full window;
+//                     start the next one"
+//
+// The memory-ordering claim, because race-freedom is the one claim this class exists to
+// make. The writer sees ready_ false (acquire), stores buffer_, length_ and
+// window_complete_, then stores ready_ true (release). The reader sees ready_ true
+// (acquire), copies what it needs, then stores ready_ false (release). The writer only
+// writes while ready_ is false and the reader only reads while it is true, so the two
+// never touch the buffer at the same instant, and each release pairs with the other
+// task's next acquire — the buffer writes happen-before the reads that consume them.
+// That strict alternation is what makes the plain buffer race-free as the abstract
+// machine defines the term, which the tuning store's seqlock (control.h) deliberately
+// cannot claim: its reader may copy a slot the writer is filling, while this reader
+// cannot, because it waits for the writer's explicit hand-off instead.
+//
+// Why there is no mutex even though both tasks touch this object. The writer is the app
+// task, whose period NFR-1.8 measures: a lock acquisition there is precisely the
+// perturbation the measurement must not contain. The alternation above costs nothing
+// when nothing is being read, and the reader never waits for the writer: a request is
+// picked up on the writer's next tick and the report lands on the reader's next poll
+// (comms runs at 50 ms), so the command's "report pending" answer is honest rather than
+// a stall.
+class TimingReportHandover {
+ public:
+  // Enough for the whole report: six lines of at most kLineBytes plus separators and the
+  // terminator (TimingService::kReportBytes = 512).
+  static constexpr size_t kCapacity = TimingService::kReportBytes;
+
+  TimingReportHandover() = default;
+
+  TimingReportHandover(const TimingReportHandover &) = delete;
+  TimingReportHandover &operator=(const TimingReportHandover &) = delete;
+
+  // --- writer's side: the task that owns the TimingService (the app task) -------------
+
+  // Format the service's current report into the buffer and mark it ready, unless a
+  // previous publication is still unread. Returns false in that case and changes nothing.
+  // The caller retries on a later tick rather than overwrite a report the reader has not
+  // consumed: the writer may only write while nothing is outstanding (see above).
+  bool publish(const TimingService &service, bool window_complete);
+
+  // True while a publication is waiting to be consumed. This is the writer's gate; the
+  // name is the reader's view of the same bit, and both must agree on it.
+  bool ready() const { return ready_.load(std::memory_order_acquire); }
+
+  // True when the reader consumed a *complete-window* report, i.e. the writer should
+  // reset its series so the next window starts accumulating. Returns false when there is
+  // nothing to reset. Only the writer may call this, and it is the only task that may
+  // reset the series — the reset happens on the writer's side so the series is touched by
+  // exactly one task.
+  bool take_reset();
+
+  // True when the reader asked for a snapshot since the writer last serviced a request,
+  // and the request is now cleared. The writer pairs this with its own tick logic: if it
+  // returns true (or the series is full), publish(); if neither, leave the series alone.
+  // Only the writer may call this.
+  bool take_request();
+
+  // --- reader's side: the comms task ---------------------------------------------------
+
+  // Ask for a snapshot of the series as it stands. Non-destructive: what comes back is a
+  // partial window if that is what has accumulated, and the series keeps accumulating
+  // after the request is serviced.
+  void request();
+
+  // The published report. buffer() and length() are valid only while ready() is true and
+  // must not be used after consume(); the reader copies what it needs first.
+  const char *buffer() const { return buffer_; }
+  size_t length() const { return length_; }
+
+  // True when the outstanding publication is a complete window (the writer published
+  // because the series filled, not because it was asked). The reader folds this into
+  // consume(), which is how the writer learns to reset.
+  bool window_complete() const { return window_complete_; }
+
+  // Mark the outstanding publication consumed and, if it was a complete window, arm the
+  // writer's reset so the next window starts only once the current one was actually read
+  // rather than dropped.
+  void consume();
+
+ private:
+  char buffer_[kCapacity]{};
+  uint32_t length_ = 0;             // written before ready_ goes true, read after
+  bool window_complete_ = false;    // same discipline
+  std::atomic<bool> ready_{false};  // writer -> reader
+  std::atomic<bool> requested_{false};    // reader -> writer
+  std::atomic<bool> reset_pending_{false}; // reader -> writer
 };
 
 } // namespace node
