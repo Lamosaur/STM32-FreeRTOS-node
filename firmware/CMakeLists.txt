@@ -1,4 +1,10 @@
 # ---------------------------------------------------------------------------
+# Boot core (Phase 2) — target-independent pieces of the bootloader. Independent of
+# the application core; declared first only so the tree reads as flash -> boot -> app.
+# ---------------------------------------------------------------------------
+add_subdirectory(boot)
+
+# ---------------------------------------------------------------------------
 # Application core — target-independent.
 #
 # Compiled identically in the host and target trees. It may include hal/ and rtos/

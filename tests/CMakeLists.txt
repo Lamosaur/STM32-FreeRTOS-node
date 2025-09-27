@@ -39,12 +39,14 @@ add_executable(node_tests
   test_control.cpp
   test_timing.cpp
   test_timing_handover.cpp
+  test_boot_crc.cpp
+  test_boot_metadata.cpp
   test_step_capture.cpp
   test_comms.cpp
   test_display.cpp
   test_node.cpp)
 
-target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main)
+target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main boot_core)
 
 # Test code gets -Wall -Wextra but not the full -Wconversion set the core library uses:
 # GoogleTest's macros and headers would drown the signal in third-party noise.
