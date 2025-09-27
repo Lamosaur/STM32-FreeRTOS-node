@@ -132,15 +132,17 @@ the gate timing is checked at the same time.
 
 ### Rows currently blocked
 
-Two Phase 1 rows cannot be filled in yet, and the reason is in the firmware rather than the
+One Phase 1 row cannot be filled in yet, and the reason is in the firmware rather than the
 bench:
 
-- **1-1 and 1-2** are measured into `TimingService`, which is single-writer: the task that
-  timestamps also owns the histogram, and the comms task cannot read it. The figures need a
-  handover buffer before they can leave the board.
 - **1-8** needs the step-response samples exported. `StepCapture` records them and
-  `host/step_response.py` can analyse them, but nothing currently arms the capture or sends
-  the samples, so the two ends of FR-1.5 are not yet joined.
+  `host/step_response.py` can analyse them, but nothing yet owns an instance, arms it, or
+  sends the samples, so the two ends of FR-1.5 are not yet joined.
+
+(Rows 1-1 and 1-2 were blocked here while `TimingService`'s single-writer design kept the
+figures on the board; `TimingReportHandover` in `app/timing.h` now hands the report to the
+comms task, and the `timing` command sends it. That remains unverified on silicon, like
+every other Phase 1 row.)
 
 ### 1-9 in more detail
 

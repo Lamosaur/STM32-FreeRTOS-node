@@ -21,9 +21,10 @@ scheme that did not survive its own test:
   delivered torn tunings under a burst of `set` commands; Section 6.1 decision 9 records the
   measurement that replaced it.
 - Phase 1's ADC/DMA HAL and actuator output are **written and linked into the image**, so
-  the paragraph below stating that they are not is corrected. The two Phase 1 pieces that
-  genuinely remain unfinished — the step-response export path and the timing service's
-  single-writer restriction — are now named there explicitly.
+  the paragraph below stating that they are not is corrected. Of the two unfinished Phase 1
+  pieces this note named, one — the timing service's single-writer restriction — is now
+  closed by `TimingReportHandover`; the step-response export path remains open and is the
+  only one left.
 
 **Revision 0.6 change:** Phase 1's decisions are settled and recorded in Section 6.1, and
 three statements in Section 6 that those decisions contradict have been corrected rather
@@ -45,19 +46,20 @@ suite now exist, and Section 5.3's open decisions are settled and recorded there
 status statements throughout this document have been corrected accordingly: no longer
 "No code written", but also not "verified on hardware" — see the note below.
 
-**What has not happened.** No firmware has been flashed to a board, and nothing has been
-measured with an instrument. A board is attached over SWD, has been identified, and its
-flash is confirmed blank (`docs/bring-up-log.md`), but every figure in Section 9 is still
-open except the ones marked host-verified in [measurements.md](measurements.md). The
-evidence for Phases 0 and 1 is evidence about logic verified on the host (FR-0.6), not
-about volts.
+**What has not happened.** No firmware has run on a board. A Blue Pill is attached over
+SWD, its flash has been measured at 128 KB and a verified image sits in it, but the board
+will not execute it: BOOT0 is not strapped low, so each reset lands in the ST factory
+bootloader (`docs/bring-up-log.md`). Every figure in Section 9 is still open except the
+ones marked host-verified in [measurements.md](measurements.md). The evidence for Phases 0
+and 1 is evidence about logic verified on the host (FR-0.6), not about volts.
 
 Within Phase 1, the acquisition service, the control loop, the tuning store, the
 step-response recorder, the ADC/DMA HAL and the actuator output all exist, are host-tested,
-and are linked into the target image. Two pieces are deliberately incomplete and are named
-here rather than implied: the step-response recorder has no export path to the host, so
-FR-1.5 is not yet satisfied end to end, and the timing service is single-writer, so its
-figures cannot yet reach the host for NFR-1.8 and NFR-1.9. Neither has run on silicon.
+and are linked into the target image, and the timing service's report now reaches the host
+through `TimingReportHandover` (`app/timing.h`, with the `timing` command). One piece is
+deliberately incomplete and is named here rather than implied: the step-response recorder
+has no instance in the node and no export path to the host, so FR-1.5 is not satisfied end
+to end. None of it has run on silicon.
 
 **Revision 0.4 change:** the record now states plainly that no implementation exists
 yet. Phase 0 is a design to be built, not an as-built description, and the design

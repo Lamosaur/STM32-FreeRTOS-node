@@ -198,6 +198,7 @@ The comms task runs a small text command set at 115200 8N1 on USART1 (PA9/PA10):
 | `ver` | Firmware version and node name |
 | `stat` | Every counter: bus transfers, failures, recoveries, contentions, timeouts, display bytes, sensor results, watchdog feeds, worst lateness |
 | `recover` | Force the FR-0.3 nine-clock bus release now, rather than waiting to catch one |
+| `timing` | The NFR-1.8/1.9 report (period jitter, ISR latency): sends a published window, or asks for a snapshot of the running one |
 | `help` | List the commands |
 
 Telemetry lines are emitted once a second:
