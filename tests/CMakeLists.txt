@@ -41,6 +41,7 @@ add_executable(node_tests
   test_timing_handover.cpp
   test_boot_crc.cpp
   test_boot_metadata.cpp
+  test_boot_decision.cpp
   test_step_capture.cpp
   test_comms.cpp
   test_display.cpp

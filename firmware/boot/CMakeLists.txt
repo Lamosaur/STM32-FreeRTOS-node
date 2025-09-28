@@ -8,7 +8,8 @@
 # ---------------------------------------------------------------------------
 add_library(boot_core STATIC
   src/crc.c
-  src/metadata.c)
+  src/metadata.c
+  src/decision.c)
 
 target_include_directories(boot_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(boot_core PRIVATE node_options_strict)
