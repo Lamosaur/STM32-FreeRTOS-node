@@ -42,12 +42,16 @@ add_executable(node_tests
   test_boot_crc.cpp
   test_boot_metadata.cpp
   test_boot_decision.cpp
+  test_boot_layout_ld.cpp
   test_step_capture.cpp
   test_comms.cpp
   test_display.cpp
   test_node.cpp)
 
 target_link_libraries(node_tests PRIVATE node_test_support GTest::gtest_main boot_core)
+
+# For tests that read files from the source tree (the linker-script cross-checks, NFR-2.9).
+target_compile_definitions(node_tests PRIVATE NODE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Test code gets -Wall -Wextra but not the full -Wconversion set the core library uses:
 # GoogleTest's macros and headers would drown the signal in third-party noise.
