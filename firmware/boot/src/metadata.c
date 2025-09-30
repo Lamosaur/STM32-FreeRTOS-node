@@ -61,3 +61,40 @@ void boot_metadata_finalize(boot_metadata_t *m) {
   }
   m->crc16 = boot_crc16((const uint8_t *)m, BOOT_METADATA_CHECKSUM_OFFSET);
 }
+
+uint32_t boot_metadata_next(const boot_metadata_t *slip_a, const boot_metadata_t *slip_b,
+                            uint32_t written_slot, uint32_t image_size, uint32_t image_crc32,
+                            uint32_t version, boot_metadata_t *out) {
+  if (out == NULL) {
+    return 0u;
+  }
+  if (written_slot != BOOT_SLOT_A && written_slot != BOOT_SLOT_B) {
+    return 0u;
+  }
+  /* The same geometry rules the validator enforces on a stored slip: a commit that
+   * would write a slip the next boot refuses is a commit that must not happen. */
+  if (image_size == 0u || image_size > BOOT_SLOT_SIZE || (image_size & 3u) != 0u) {
+    return 0u;
+  }
+
+  const boot_metadata_t *winner = boot_metadata_newer(slip_a, slip_b);
+  uint32_t write_page;
+  if (winner == slip_b) {
+    write_page = BOOT_METADATA_A_BASE;
+  } else if (winner == slip_a) {
+    write_page = BOOT_METADATA_B_BASE;
+  } else {
+    write_page = BOOT_METADATA_A_BASE; /* nothing valid anywhere: A is the first home */
+  }
+
+  out->magic = BOOT_METADATA_MAGIC;
+  out->sequence = (winner != NULL ? winner->sequence : 0u) + 1u;
+  out->active_slot = written_slot;
+  out->image_size = image_size;
+  out->image_crc32 = image_crc32;
+  out->version = version;
+  out->reserved = 0u;
+  out->reserved16 = 0u;
+  boot_metadata_finalize(out);
+  return write_page;
+}

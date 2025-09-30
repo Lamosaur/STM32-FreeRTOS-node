@@ -10,7 +10,8 @@ add_library(boot_core STATIC
   src/crc.c
   src/metadata.c
   src/decision.c
-  src/frame.c)
+  src/frame.c
+  src/region.c)
 
 target_include_directories(boot_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(boot_core PRIVATE node_options_strict)
@@ -22,6 +23,8 @@ target_compile_features(boot_core PUBLIC c_std_11)
 if(CMAKE_CROSSCOMPILING)
   add_executable(bootloader.elf
     src/boot_main.c
+    src/boot_update.c
+    src/jump.c
     src/boot_uart.c
     src/flash.c
     startup_boot.s)

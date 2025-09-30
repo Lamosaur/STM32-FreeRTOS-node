@@ -132,6 +132,77 @@ TEST(BootMetadataTest, FinalizeFollowsFieldChanges) {
 }
 
 // ---------------------------------------------------------------------------
+// boot_metadata_next — the commit's slip construction (Lesson 4b).
+// ---------------------------------------------------------------------------
+
+TEST(BootMetadataTest, NextWritesToTheLoserPageAndIncrementsTheSequence) {
+  const boot_metadata_t slip_a = make_slip(10u, BOOT_SLOT_A);
+  const boot_metadata_t slip_b = make_slip(11u, BOOT_SLOT_B);
+
+  boot_metadata_t next;
+  const uint32_t page =
+      boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_A, 0x1000u, 0xDEADBEEFu, 42u, &next);
+  EXPECT_EQ(page, BOOT_METADATA_A_BASE); /* B is winning, so the new slip goes to A */
+  EXPECT_EQ(next.sequence, 12u);         /* winner(11) + 1 */
+  EXPECT_EQ(next.active_slot, BOOT_SLOT_A);
+  EXPECT_EQ(next.image_size, 0x1000u);
+  EXPECT_EQ(next.image_crc32, 0xDEADBEEFu);
+  EXPECT_EQ(next.version, 42u);
+  EXPECT_TRUE(boot_metadata_validate(&next));
+}
+
+TEST(BootMetadataTest, NextAlternatesToTheOtherPageWhenAIsWinning) {
+  const boot_metadata_t slip_a = make_slip(10u, BOOT_SLOT_A);
+  const boot_metadata_t slip_b = make_slip(9u, BOOT_SLOT_B);
+
+  boot_metadata_t next;
+  const uint32_t page =
+      boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_B, 0x1000u, 1u, 2u, &next);
+  EXPECT_EQ(page, BOOT_METADATA_B_BASE); /* A is winning, so the new slip goes to B */
+  EXPECT_EQ(next.sequence, 11u);
+  EXPECT_EQ(next.active_slot, BOOT_SLOT_B);
+}
+
+TEST(BootMetadataTest, FirstEverCommitGoesToPageAWithSequenceOne) {
+  boot_metadata_t erased_a, erased_b;
+  std::memset(&erased_a, 0xFF, sizeof(erased_a));
+  std::memset(&erased_b, 0xFF, sizeof(erased_b));
+
+  boot_metadata_t next;
+  const uint32_t page =
+      boot_metadata_next(&erased_a, &erased_b, BOOT_SLOT_B, 0x800u, 7u, 1u, &next);
+  EXPECT_EQ(page, BOOT_METADATA_A_BASE);
+  EXPECT_EQ(next.sequence, 1u);
+  EXPECT_EQ(next.active_slot, BOOT_SLOT_B);
+  EXPECT_TRUE(boot_metadata_validate(&next));
+}
+
+TEST(BootMetadataTest, NextRefusesAnInvalidCommit) {
+  const boot_metadata_t slip_a = make_slip(1u, BOOT_SLOT_A);
+  const boot_metadata_t slip_b = make_slip(2u, BOOT_SLOT_B);
+  boot_metadata_t next;
+
+  EXPECT_EQ(boot_metadata_next(&slip_a, &slip_b, 0u, 0x1000u, 1u, 1u, &next), 0u);
+  EXPECT_EQ(boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_A, 0u, 1u, 1u, &next), 0u);
+  EXPECT_EQ(boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_A, BOOT_SLOT_SIZE + 1u, 1u, 1u,
+                               &next), 0u);
+  EXPECT_EQ(boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_A, 0x402u, 1u, 1u, &next), 0u);
+  EXPECT_EQ(boot_metadata_next(&slip_a, &slip_b, BOOT_SLOT_A, 0x1000u, 1u, 1u, nullptr), 0u);
+}
+
+TEST(BootMetadataTest, NextSurvivesSequenceWrap) {
+  // A sequence at the top of the 32-bit range must still produce a valid, higher-by-
+  // wraparound sequence the validator accepts.
+  const boot_metadata_t slip_a = make_slip(0xFFFFFFFEu, BOOT_SLOT_A);
+  boot_metadata_t next;
+  const uint32_t page =
+      boot_metadata_next(&slip_a, &slip_a, BOOT_SLOT_B, 0x1000u, 1u, 1u, &next);
+  EXPECT_NE(page, 0u);
+  EXPECT_EQ(next.sequence, 0xFFFFFFFFu);
+  EXPECT_TRUE(boot_metadata_validate(&next));
+}
+
+// ---------------------------------------------------------------------------
 // Layout invariants (NFR-2.9): the map must tile exactly and stay page-aligned.
 // Editing layout.h into nonsense fails here rather than on a bricked board.
 // ---------------------------------------------------------------------------

@@ -86,6 +86,20 @@ const boot_metadata_t *boot_metadata_newer(const boot_metadata_t *a,
  * a slip by: erase the slip's page, program the struct with crc16 filled by this call. */
 void boot_metadata_finalize(boot_metadata_t *m);
 
+/* Build the slip for the next commit and say which metadata page it must be written to.
+ * `written_slot` is the slot the update just filled; `image_size`/`image_crc32`/`version`
+ * are what the host supplied and what verification has already agreed with the flash. The
+ * new slip's sequence is the winning slip's plus one, and it goes to the metadata page
+ * that is NOT winning — the whole two-slip argument: a power cut during the commit's own
+ * erase/program leaves the winning slip intact, so the previous app still boots. With no
+ * winning slip (a fresh part) slip A is the natural first home.
+ *
+ * Returns the page base to program, or 0 if the inputs cannot be a valid slip (bad slot,
+ * zero or oversized or misaligned image size). On 0 the caller must refuse the commit. */
+uint32_t boot_metadata_next(const boot_metadata_t *slip_a, const boot_metadata_t *slip_b,
+                            uint32_t written_slot, uint32_t image_size, uint32_t image_crc32,
+                            uint32_t version, boot_metadata_t *out);
+
 #ifdef __cplusplus
 }
 #endif

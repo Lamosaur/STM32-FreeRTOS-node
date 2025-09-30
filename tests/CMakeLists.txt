@@ -43,6 +43,7 @@ add_executable(node_tests
   test_boot_metadata.cpp
   test_boot_decision.cpp
   test_boot_frame.cpp
+  test_boot_region.cpp
   test_boot_layout_ld.cpp
   test_step_capture.cpp
   test_comms.cpp
