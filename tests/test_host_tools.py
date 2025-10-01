@@ -415,5 +415,179 @@ class StepResponseCliTests(unittest.TestCase):
         self.assertFalse(step_response.plot(records, analysis, "/dev/null"))
 
 
+# ---------------------------------------------------------------------------
+# The flasher: Phase 2's host half of the update protocol (FR-2.4, NFR-2.7)
+# ---------------------------------------------------------------------------
+
+import flasher  # noqa: E402
+
+
+class FakePort(flasher.Port):
+    """Serves canned reply frames byte by byte, and records everything sent."""
+
+    def __init__(self, replies):
+        self._buffer = b"".join(replies)
+        self._pos = 0
+        self.sent = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.sent += data
+
+    def read_byte(self, timeout_ms: int) -> Optional[int]:
+        if self._pos >= len(self._buffer):
+            return None
+        byte = self._buffer[self._pos]
+        self._pos += 1
+        return byte
+
+    def close(self) -> None:
+        pass
+
+
+def ok_reply(payload: bytes = b"") -> bytes:
+    return flasher.encode_frame(flasher.STATUS_OK, payload)
+
+
+def meta_payload(slot: int = 1, size: int = 0x400, version: int = 7) -> bytes:
+    """The 32-byte slip layout from boot/metadata.h: magic, sequence, slot, size, crc,
+    version, then two reserved words. The host reads slot(8), size(12), version(20)."""
+    return b"".join(
+        int.to_bytes(v, 4, "little")
+        for v in (0xB007B007, 9, slot, size, 0x12345678, version, 0, 0)
+    )
+
+
+def split_frames(data: bytes):
+    """Parse a byte stream into (status/cmd, payload) frames through the same receiver
+    the session uses — the test thus relies on the code under test only to the extent it
+    exercises the receiver, which the canonical-frame tests pin independently."""
+    rx = flasher.Receiver()
+    frames = []
+    for byte in data:
+        done = rx.feed(byte)
+        if done is not None:
+            frames.append(done)
+    return frames
+
+
+class CrcTests(unittest.TestCase):
+    def test_crc16_matches_the_ccitt_false_check_value(self) -> None:
+        self.assertEqual(flasher.crc16(b"123456789"), 0x29B1)
+
+    def test_crc32_matches_the_ieee_check_value(self) -> None:
+        self.assertEqual(flasher.crc32(b"123456789"), 0xCBF43926)
+
+
+class FrameTests(unittest.TestCase):
+    def test_the_canonical_frame_is_the_same_bytes_as_the_c_side(self) -> None:
+        # test_boot_frame.cpp decodes exactly these bytes through the C receiver; this is
+        # FR-2.4's "one framed protocol" made concrete across the two test suites.
+        self.assertEqual(
+            flasher.encode_frame(flasher.CMD_HELLO), bytes.fromhex("aa01003e2e")
+        )
+
+    def test_an_encoded_reply_decodes_through_the_receiver(self) -> None:
+        rx = flasher.Receiver()
+        last = None
+        for byte in ok_reply(b"boot 0.1.0"):
+            last = rx.feed(byte)
+        self.assertEqual(last, (flasher.STATUS_OK, b"boot 0.1.0"))
+
+    def test_a_corrupted_frame_is_refused_and_the_receiver_resyncs(self) -> None:
+        bad = bytearray(ok_reply(b"boot 0.1.0"))
+        bad[-1] ^= 0xFF
+        rx = flasher.Receiver()
+        for byte in bad:
+            self.assertIsNone(rx.feed(byte))
+        last = None
+        for byte in ok_reply(b"boot 0.1.0"):
+            last = rx.feed(byte)
+        self.assertEqual(last, (flasher.STATUS_OK, b"boot 0.1.0"))
+
+
+class SessionTests(unittest.TestCase):
+    def test_a_nak_with_a_reason_aborts(self) -> None:
+        port = FakePort([flasher.encode_frame(flasher.STATUS_BAD_ADDR)])
+        with self.assertRaises(flasher.UpdateError) as ctx:
+            flasher.Session(port).command(flasher.CMD_ERASE, (0).to_bytes(4, "little"))
+        self.assertIn("bad address", str(ctx.exception))
+
+    def test_a_bad_crc_reply_is_retried_in_place(self) -> None:
+        bad = bytearray(ok_reply())
+        bad[-1] ^= 0x01
+        port = FakePort([bytes(bad), ok_reply()])
+        status, _ = flasher.Session(port).command(flasher.CMD_HELLO)
+        self.assertEqual(status, flasher.STATUS_OK)
+
+
+class UpdateTests(unittest.TestCase):
+    def test_a_full_update_targets_the_other_slot_and_commits_the_real_crc(self) -> None:
+        image = bytes(range(256)) * 5  # 1280 bytes: two pages, exercising the clamp on
+                                       # the last write of each page
+        replies = [
+            ok_reply(b"boot 0.1.0"),    # HELLO
+            ok_reply(meta_payload(slot=1, size=0x400, version=3)),  # GET_META: active A
+        ]
+        for _ in range(2):              # ERASE x2
+            replies.append(ok_reply())
+        for _ in range(7):              # WRITE: 5 for page 0, 2 for page 1
+            replies.append(ok_reply())
+        replies.append(ok_reply())      # COMMIT
+        replies.append(ok_reply())      # RESET
+
+        port = FakePort(replies)
+        summary = flasher.update(port, image, version=9)
+        self.assertIn("slot B", summary)      # active A -> the update writes B
+        self.assertIn("committed v9", summary)
+
+        frames = split_frames(bytes(port.sent))
+        commands = [cmd for cmd, _ in frames]
+        # Per page: ERASE the page, then WRITE it (5 frames for a full page, 2 for the
+        # half page) — the same erase-before-write discipline the target enforces.
+        self.assertEqual(commands, [
+            flasher.CMD_HELLO,
+            flasher.CMD_GET_META,
+            flasher.CMD_ERASE,
+        ] + [flasher.CMD_WRITE] * 5 + [
+            flasher.CMD_ERASE,
+        ] + [flasher.CMD_WRITE] * 2 + [flasher.CMD_COMMIT, flasher.CMD_RESET])
+
+        # Both ERASEs target slot B's pages, not slot A — the running app's pages are
+        # never erased before the new image is verified (the boot-0 rule).
+        erases = [payload for cmd, payload in frames if cmd == flasher.CMD_ERASE]
+        self.assertEqual(int.from_bytes(erases[0][:4], "little"), flasher.SLOT_B_BASE)
+        self.assertEqual(
+            int.from_bytes(erases[1][:4], "little"),
+            flasher.SLOT_B_BASE + flasher.FLASH_PAGE_SIZE,
+        )
+
+        # Every byte of the image arrived, in order, across the WRITE frames.
+        written = b"".join(payload[4:] for cmd, payload in frames if cmd == flasher.CMD_WRITE)
+        self.assertEqual(written, image)
+
+        # COMMIT carries the real size, CRC-32 and version, so the bootloader's own
+        # re-verification over flash agrees with the file on the host.
+        commit = next(payload for cmd, payload in frames if cmd == flasher.CMD_COMMIT)
+        self.assertEqual(commit, (
+            len(image).to_bytes(4, "little")
+            + flasher.crc32(image).to_bytes(4, "little")
+            + (9).to_bytes(4, "little")
+        ))
+
+    def test_read_metadata_reports_a_fresh_part(self) -> None:
+        port = FakePort([ok_reply(meta_payload(slot=0, size=0, version=0))])
+        slot, size, version = flasher.read_metadata(flasher.Session(port))
+        self.assertEqual((slot, size, version), (0, 0, 0))
+
+
+class BudgetTests(unittest.TestCase):
+    def test_the_42k_image_fits_nfr_27s_30_second_budget(self) -> None:
+        # 115200 baud is 11520 bytes/s; the upper bound must come in well under 30 s even
+        # with the current ~42 KB app. (A real bound is a few percent less.)
+        size = 42 * 1024 + 512  # larger than today's image
+        bytes_needed = flasher.transfer_budget_bytes(size)
+        self.assertLess(bytes_needed, 30 * 11520)
+
+
 if __name__ == "__main__":
     unittest.main()

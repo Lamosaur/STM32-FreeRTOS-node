@@ -43,6 +43,24 @@ boot_frame_result_t feed(boot_frame_rx_t *rx, const uint8_t *frame, size_t n,
   return r;
 }
 
+TEST(BootFrameTest, TheCanonicalFrameMatchesTheHostToolSide) {
+  // The empty HELLO frame, byte for byte as host/flasher.py's encoder produces it and
+  // test_host_tools.py pins: aa 01 00 3e 2e. Both suites decode these same bytes —
+  // that is FR-2.4's "one framed protocol" checked, not asserted.
+  const uint8_t wire[] = {0xAA, 0x01, 0x00, 0x3E, 0x2E};
+  boot_frame_rx_t rx;
+  boot_frame_rx_init(&rx);
+  uint8_t cmd = 0, len = 0;
+  const uint8_t *payload = nullptr;
+  boot_frame_result_t result = BOOT_FRAME_MORE;
+  for (size_t i = 0; i < sizeof(wire); ++i) {
+    result = boot_frame_rx_byte(&rx, wire[i], &cmd, &len, &payload);
+  }
+  EXPECT_EQ(result, BOOT_FRAME_COMPLETE);
+  EXPECT_EQ(cmd, BOOT_CMD_HELLO);
+  EXPECT_EQ(len, 0u);
+}
+
 TEST(BootFrameTest, AWholeFrameDecodes) {
   const uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
   uint8_t frame[16];
