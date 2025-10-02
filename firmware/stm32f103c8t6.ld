@@ -83,6 +83,11 @@ RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 20K
  */
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 
+/* This image's own home, used for the FR-2.3 vector-table relocation: main_target.cpp
+ * sets SCB->VTOR against it, so this base build and the slot build name the same
+ * symbol and both place the vector table correctly for wherever they were linked. */
+_app_base = ORIGIN(FLASH);
+
 /* Define output sections */
 SECTIONS
 {

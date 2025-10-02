@@ -244,6 +244,15 @@ void bootstrap_task(void *argument) {
 } // namespace
 
 extern "C" int main(void) {
+  /* FR-2.3, made explicit rather than assumed: own the vector table. The bootloader
+   * relocated it before jumping to this image; a direct power-on without a bootloader
+   * leaves it at the reset alias, which this also replaces with a concrete address.
+   * Either way the table is this image's, at its own flash base — the same symbol
+   * under the base and the slot linker scripts, because both define _app_base as
+   * ORIGIN(FLASH). Runs before anything can raise an interrupt. */
+  extern char _app_base;
+  SCB->VTOR = (uint32_t)&_app_base;
+
   // Clocks, the HAL timebase, the DWT microsecond counter, the backup-domain boot
   // counter, the GPIO table, I2C1 and USART1. The watchdog is deliberately not started
   // here: FR-0.4 requires a task to own that decision.

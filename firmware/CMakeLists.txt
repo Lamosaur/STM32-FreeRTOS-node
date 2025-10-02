@@ -43,15 +43,20 @@ if(CMAKE_CROSSCOMPILING)
   add_subdirectory(rtos/freertos)
   add_subdirectory(hal/stm32f1)
 
-  add_executable(firmware.elf
+  # The application image's sources, shared by both homes it is linked for:
+  # firmware.elf at 0x08000000 (direct SWD flashing, bring-up) and firmware.slot at
+  # the slot base (the Phase 2 artifact host/flasher.py uploads). Startup and clock
+  # setup come from the vendored CMSIS device package, listed as executable sources
+  # rather than hidden inside a static library: the linker only pulls a library
+  # member that resolves an undefined reference, and the vector table is not
+  # referenced by anything, so in a library it can be dropped and the image links to
+  # a garbage reset vector.
+  set(NODE_APP_IMAGE_SOURCES
     app/src/main_target.cpp
-    # Startup and clock setup come from the vendored CMSIS device package. They are
-    # listed as executable sources rather than hidden inside a static library: the
-    # linker only pulls a library member that resolves an undefined reference, and the
-    # vector table is not referenced by anything, so in a library it can be dropped and
-    # the image links to a garbage reset vector.
     ${THIRD_PARTY_DIR}/cmsis-device-f1/Source/gcc/startup_stm32f103xb.s
     ${THIRD_PARTY_DIR}/cmsis-device-f1/Source/system_stm32f1xx.c)
+
+  add_executable(firmware.elf ${NODE_APP_IMAGE_SOURCES})
 
   # Every object library is named explicitly, including the two internal ones
   # (*_kernel, *_vendor). CMake does not propagate an object library's objects through
@@ -94,4 +99,35 @@ if(CMAKE_CROSSCOMPILING)
     COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:firmware.elf> firmware.bin
     COMMAND ${CMAKE_SIZE} $<TARGET_FILE:firmware.elf>
     COMMENT "Producing firmware.hex and firmware.bin")
+
+  # -------------------------------------------------------------------------
+  # The same application, linked at the slot base. The image content is identical
+  # to firmware.elf; only its home address differs, and the vector table travels
+  # with it (FR-2.3, via the _app_base symbol and SCB->VTOR in main_target.cpp).
+  # This bin is what the bootloader expects and what host/flasher.py uploads.
+  # -------------------------------------------------------------------------
+  add_executable(firmware.slot ${NODE_APP_IMAGE_SOURCES})
+
+  target_link_libraries(firmware.slot PRIVATE
+    sensor_core
+    node_rtos_freertos
+    node_rtos_freertos_kernel
+    node_hal_stm32f1
+    node_hal_stm32f1_vendor)
+  target_link_libraries(firmware.slot PRIVATE node_options_strict)
+
+  target_link_options(firmware.slot PRIVATE
+    -T${CMAKE_CURRENT_SOURCE_DIR}/stm32f103c8t6_slot.ld
+    -Wl,--gc-sections
+    -Wl,-Map=firmware.slot.map
+    -Wl,--print-memory-usage
+    -nostartfiles
+    -specs=nano.specs -specs=nosys.specs)
+  set_target_properties(firmware.slot PROPERTIES
+    LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/stm32f103c8t6_slot.ld)
+
+  add_custom_command(TARGET firmware.slot POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:firmware.slot> firmware.slot.bin
+    COMMAND ${CMAKE_SIZE} $<TARGET_FILE:firmware.slot>
+    COMMENT "Producing firmware.slot.bin (the update image for host/flasher.py)")
 endif()
