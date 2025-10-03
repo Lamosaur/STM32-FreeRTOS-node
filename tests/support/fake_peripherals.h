@@ -163,12 +163,20 @@ class FakeSystem {
     iface_.ctx = this;
     iface_.reset_cause = &FakeSystem::reset_cause_cb;
     iface_.boot_count = &FakeSystem::boot_count_cb;
+    iface_.update_request = &FakeSystem::update_request_cb;
+    iface_.system_reset = &FakeSystem::system_reset_cb;
   }
 
   hal_system_iface_t *iface() { return &iface_; }
 
   void set_reset_cause(hal_reset_cause_t cause) { cause_ = cause; }
   void set_boot_count(uint32_t count) { boot_count_ = count; }
+
+  // The Phase 2 update handshake: the request can be made to fail, which drives comms's
+  // honest-failure path, and both calls are counted.
+  void set_update_request_result(bool ok) { update_ok_ = ok; }
+  uint32_t update_requests() const { return update_requests_; }
+  uint32_t resets() const { return resets_; }
 
  private:
   static hal_reset_cause_t reset_cause_cb(void *ctx) {
@@ -179,9 +187,22 @@ class FakeSystem {
     return static_cast<FakeSystem *>(ctx)->boot_count_;
   }
 
+  static bool update_request_cb(void *ctx) {
+    FakeSystem *self = static_cast<FakeSystem *>(ctx);
+    self->update_requests_++;
+    return self->update_ok_;
+  }
+
+  static void system_reset_cb(void *ctx) {
+    static_cast<FakeSystem *>(ctx)->resets_++;
+  }
+
   hal_system_iface_t iface_{};
   hal_reset_cause_t cause_ = HAL_RESET_POWER_ON;
   uint32_t boot_count_ = 1;
+  bool update_ok_ = true;
+  uint32_t update_requests_ = 0;
+  uint32_t resets_ = 0;
 };
 
 } // namespace node::test

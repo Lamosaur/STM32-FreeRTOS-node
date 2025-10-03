@@ -258,6 +258,36 @@ TEST_F(CommsTest, SetChangesEveryFieldWithoutAReflash) {
   EXPECT_NE(out.find("set min=60 ok"), std::string::npos);
 }
 
+TEST_F(CommsTest, UpdateRequestsTheMarkerAndThenResets) {
+  ASSERT_TRUE(service->handle_command("update"));
+
+  EXPECT_NE(uart.transmitted().find("update: rebooting into the bootloader"),
+            std::string::npos);
+  // Both halves of the Phase 2 handshake happened, in the order that matters.
+  EXPECT_EQ(system.update_requests(), 1u);
+  EXPECT_EQ(system.resets(), 1u);
+}
+
+TEST_F(CommsTest, UpdateReportsAFailedMarkerAndDoesNotReset) {
+  system.set_update_request_result(false);
+
+  ASSERT_TRUE(service->handle_command("update"));
+
+  EXPECT_NE(uart.transmitted().find("update: marker failed"), std::string::npos);
+  // The honest failure path: without the marker a reset would boot normally and the
+  // host would think an update was coming.
+  EXPECT_EQ(system.update_requests(), 1u);
+  EXPECT_EQ(system.resets(), 0u);
+}
+
+TEST_F(CommsTest, UpdateWithoutASystemIsRefusedNotSilent) {
+  // A comms service with no system source cannot honour the handshake; saying so beats
+  // pretending the node can update itself.
+  CommsService bare(uart.iface(), &arbiter, rtos.iface(), CommsSources{});
+  ASSERT_TRUE(bare.handle_command("update"));
+  EXPECT_NE(uart.transmitted().find("update unsupported"), std::string::npos);
+}
+
 TEST_F(CommsTest, TimingCommandSendsAPublishedReportAndConsumesIt) {
   TimingService timing;
   timing.note_period_us(1'000'000);

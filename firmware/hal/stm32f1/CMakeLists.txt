@@ -72,7 +72,8 @@ add_library(node_hal_stm32f1 OBJECT
 
 target_include_directories(node_hal_stm32f1 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}                 # stm32f1xx_hal_conf.h, hal_stm32f1.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/../include)     # the hal/ interfaces it implements
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include      # the hal/ interfaces it implements
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../boot/include)  # boot/update.h: the marker contract
 target_link_libraries(node_hal_stm32f1 PUBLIC node_hal_stm32f1_vendor)
 
 # The I2C DMA path and the UART receive path use FreeRTOS semaphores, so the HAL depends

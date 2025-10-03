@@ -60,7 +60,8 @@ boot_frame_result_t boot_frame_rx_byte(boot_frame_rx_t *rx, uint8_t byte,
     case 5: /* CRC high byte; the frame is complete */
       rx->phase = 0; /* resync for the next frame regardless of the verdict below */
       {
-        const uint16_t expected_crc = (uint16_t)((uint16_t)byte << 8) | rx->crc_low;
+        const uint16_t expected_crc =
+            (uint16_t)(((uint16_t)byte << 8) | (uint16_t)rx->crc_low);
         /* The checksum covers command, length and payload — everything from buf[0] to
          * the end of the payload, which is fill bytes at this point. */
         const uint16_t actual_crc = boot_crc16(rx->buf, rx->fill);
@@ -91,7 +92,7 @@ uint16_t boot_frame_encode(uint8_t *out, uint16_t capacity, uint8_t status,
     return 0u;
   }
   /* sync(1) + status(1) + len(1) + payload(len) + crc(2) */
-  const uint16_t total = 5u + (uint16_t)len;
+  const uint16_t total = (uint16_t)(5u + (uint16_t)len);
   if (capacity < total) {
     return 0u;
   }

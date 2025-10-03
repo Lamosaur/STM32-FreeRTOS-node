@@ -83,7 +83,11 @@ static const uint32_t kCrc32Table[256] = {
 uint16_t boot_crc16(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFFu;
   for (size_t i = 0; i < len; ++i) {
-    crc = (uint16_t)((crc << 8) ^ kCrc16Table[((crc >> 8) ^ data[i]) & 0xFFu]);
+    /* Explicit widths throughout: the promotions differ between host and target, and
+     * both toolchains must compile this with -Wconversion -Werror. */
+    const uint8_t byte = data[i];
+    const uint16_t index = (uint16_t)((crc >> 8) ^ (uint16_t)byte);
+    crc = (uint16_t)((uint16_t)(crc << 8) ^ kCrc16Table[index]);
   }
   return crc;
 }
@@ -94,7 +98,9 @@ uint16_t boot_crc16(const uint8_t *data, size_t len) {
 uint32_t boot_crc32(const uint8_t *data, size_t len) {
   uint32_t crc = 0xFFFFFFFFu;
   for (size_t i = 0; i < len; ++i) {
-    crc = kCrc32Table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    const uint8_t byte = data[i];
+    const uint32_t index = (uint32_t)((crc ^ (uint32_t)byte) & 0xFFu);
+    crc = kCrc32Table[index] ^ (crc >> 8);
   }
   return crc ^ 0xFFFFFFFFu;
 }

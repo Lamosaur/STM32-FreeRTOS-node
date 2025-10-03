@@ -19,6 +19,10 @@
 
 #include "hal_stm32f1.h"
 
+// The update marker contract shared with the bootloader (Phase 2): the value and the
+// backup register number, both defined once so the two images cannot disagree.
+#include "boot/update.h"
+
 #include "stm32f1xx_hal.h"
 
 /* BKP_DR1 holds the count, BKP_DR2 the marker that says DR1 is meaningful. The marker
@@ -105,10 +109,35 @@ static uint32_t system_boot_count(void *ctx) {
   return s_boot_count;
 }
 
+static bool system_update_request(void *ctx) {
+  (void)ctx;
+  /* The same backup-domain dance as count_boot(): clocks first, then the write-protect
+   * lift, then the register. The marker is the one the bootloader reads at every boot
+   * (boot/update.h); writing it is the whole request, and the caller decides when to
+   * reset so it can say goodbye on the wire first. */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_RCC_BKP_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+
+  BKP->DR3 = BOOT_UPDATE_MARKER;
+
+  HAL_PWR_DisableBkUpAccess();
+  return true;
+}
+
+static void system_reset(void *ctx) {
+  (void)ctx;
+  NVIC_SystemReset();
+  for (;;) { /* not reached */
+  }
+}
+
 static hal_system_iface_t s_system = {
     .ctx = NULL,
     .reset_cause = system_reset_cause,
     .boot_count = system_boot_count,
+    .update_request = system_update_request,
+    .system_reset = system_reset,
 };
 
 hal_system_iface_t *hal_system_stm32f1(void) {

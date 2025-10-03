@@ -665,8 +665,29 @@ bool CommsService::handle_command(const char *line) {
     return true;
   }
 
+  if (std::strcmp(line, "update") == 0) {
+    // Phase 2 handshake: ask the bootloader to accept an update. The marker write and
+    // the reset are separate interface calls so a failed marker can be reported
+    // honestly — a reset without the marker would boot normally and the host would
+    // wonder what happened. The farewell is sent before the reset; the reset does not
+    // wait for the port to drain, and the marker is what survives.
+    if (sources_.system == nullptr || sources_.system->update_request == nullptr) {
+      send_line("update unsupported");
+      return true;
+    }
+    if (!sources_.system->update_request(sources_.system->ctx)) {
+      send_line("update: marker failed; the node keeps running");
+      return true;
+    }
+    send_line("update: rebooting into the bootloader");
+    if (sources_.system->system_reset != nullptr) {
+      sources_.system->system_reset(sources_.system->ctx);
+    }
+    return true;
+  }
+
   if (std::strcmp(line, "help") == 0) {
-    send_line("cmd ver | stat | get | set <k=v> | recover | timing | help");
+    send_line("cmd ver | stat | get | set <k=v> | recover | timing | update | help");
     return true;
   }
 

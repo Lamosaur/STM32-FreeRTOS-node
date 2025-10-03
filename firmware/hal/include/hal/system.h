@@ -39,6 +39,22 @@ typedef struct hal_system_iface {
    * an unattended run is clean if this stays at 1.
    */
   uint32_t (*boot_count)(void *ctx);
+
+  /* Phase 2. The application's side of the update handshake: write the update marker
+   * into the backup domain (the same persistence the boot counter uses), so that after
+   * the caller resets, the bootloader opens its update window (boot/update.h,
+   * boot_update_marker_read). The write is separated from the reset so the caller can
+   * report a failure honestly: false means the marker was NOT written, the node is
+   * still running, and a reset right now would boot normally — the caller must not
+   * reset on false.
+   */
+  bool (*update_request)(void *ctx);
+
+  /* Reset the part now. Used for the update jump after a successful update_request;
+   * the caller emits any farewell over the UART first, because the reset does not wait
+   * for the port to drain. The marker in the backup domain is what survives the reset.
+   */
+  void (*system_reset)(void *ctx);
 } hal_system_iface_t;
 
 #ifdef __cplusplus
