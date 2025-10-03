@@ -1,9 +1,16 @@
 # Design Specification and Requirements Plan
 
 **Project:** STM32 FreeRTOS Sensor & Control Node
-**Revision:** 0.7 (draft)
-**Status:** Phases 0 and 1 implemented and host-verified; Phases 2-3 planned; Phase 4
-deferred
+**Revision:** 0.8 (draft)
+**Status:** Phases 0, 1 and 2 implemented and host-verified; Phase 3 planned; Phase 4
+deferred. Nothing has run on silicon: the bench board still boots into the factory
+bootloader until BOOT0 is strapped low (docs/bring-up-log.md).
+
+**Revision 0.8 change:** Phase 2 is implemented and host-verified. The approvals behind
+it — the A/B two-slot layout, CRC-32 for the image, the application-command + backup-
+register entry into update mode — and the as-built detail are recorded in Section 7,
+which was previously a plan for work not yet started. The status line above is
+corrected accordingly.
 
 **Revision 0.7 change:** the document now describes the hardware and the mechanism the
 firmware actually uses. Revision 0.6 got the sensor set wrong and named a tuning-publication
@@ -525,18 +532,110 @@ is not planned.
 
 ## 7. Phase 2 design — bootloader and field update
 
-**Flash layout:** bootloader in a protected sector, application offset above it,
-update metadata (version, CRC, image size) in a dedicated sector. Layout constants
-live in one header so NFR-2.9 holds.
+Phase 2 is implemented and host-verified: a second image, an 8 KB freestanding C
+bootloader at 0x08000000, plus the host flasher. The authority for every decision below
+is a header, a test, or a file in `firmware/boot/` and `host/flasher.py`, exactly as in
+Sections 5.3 and 6.1. None of it has run on silicon yet — the code is exercised by the
+host test suite and the images build clean on both toolchains.
 
-**Update sequence:** host sends image → bootloader writes to a staging region →
-CRC-16 verified → metadata committed → reset → bootloader validates and jumps with
-`SCB->VTOR` relocated. A failed CRC or an interrupted transfer leaves the previous
-valid metadata intact (FR-2.5).
+### 7.1 The flash map (NFR-2.9)
 
-**New work, not reuse:** neither half of the framed protocol exists yet. The host
-uploader (length-prefixed, CRC-16, ACK/retry) and the target-side bootloader are both
-written in this phase, against the framing defined here.
+```
+0x08000000  bootloader   8 KB   firmware/boot, stm32f103c8t6_boot.ld
+0x08002000  slot A      56 KB   the application image
+0x08010000  slot B      56 KB   the other application image
+0x0801E000  metadata A   1 KB   two slips, higher sequence wins; ~32 B used
+0x0801E400  metadata B   1 KB
+0x0801E800  spare        6 KB
+```
+
+All geometry lives in `firmware/boot/include/boot/layout.h` (approved: 8 KB bootloader,
+56 KB slots, two-slot metadata, 6 KB spare). Two application linker scripts exist —
+the slot build (`stm32f103c8t6_slot.ld`, the update artifact) and the base build for
+direct SWD flashing — and a host test reads all three scripts back and cross-checks
+them against the header, so a literal cannot drift like the `_estack` value once did.
+
+Two slots, and two metadata slips, are the same argument at two scales: something must
+always be runnable (the boot-0 rule). The update writes the slot that is NOT running;
+a power cut anywhere before the commit leaves the old app intact. The metadata that
+records the commit is itself written non-atomically (erase, then program), so it gets
+the same treatment one level down: two slips, written alternately, higher sequence
+wins (wraparound-safe). A power cut in the commit's own window leaves the previous
+slip whole.
+
+### 7.2 The boot decision (FR-2.2)
+
+`boot_decide()` (`firmware/boot/src/decision.c`, pure and host-tested) returns "run
+slot A", "run slot B", or "stay in the bootloader", in this order:
+
+1. Update requested (the backup-register marker) and the 30 s idle window open → stay
+   and accept frames.
+2. The newest valid slip's image **CRC-32 over live flash** verifies against the slip →
+   run that slot. The slip is a promise; the flash is the evidence.
+3. It fails → roll back to the slot the loser slip names (the previously active image —
+   last week's firmware beats nothing).
+4. Nothing verifies → stay. FR-2.2's letter: a failed image leaves the node in the
+   bootloader, which is itself the bootable image.
+
+The marker + window pair is the anti-brick: at expiry the marker is cleared and the
+ladder decides, so a host that never finished cannot wedge the node in update mode.
+
+### 7.3 The jump (FR-2.3)
+
+Running an image at a slot base needs its vector table at the slot base. The bootloader
+loads the image's initial MSP from the image's own first word, sets `SCB->VTOR` to the
+slot base, and branches to the reset PC with the Thumb bit set (`firmware/boot/src/jump.c`).
+The application also sets `SCB->VTOR` against `_app_base` (`ORIGIN(FLASH)` in both app
+scripts) as the first thing its `main` does, so it is correct whether the bootloader
+launched it or it is powering on alone. The reset alias at 0x00000000 no longer needs to
+be the source of truth for interrupts.
+
+### 7.4 The update protocol (FR-2.4)
+
+One frame shape, both ends (`firmware/boot/include/boot/frame.h`):
+
+```
+0xAA  cmd  len(0..240)  payload[len]  crc16-ccitt(LE, over cmd..payload)
+```
+
+Stop-and-wait: the host sends a frame and waits for the reply, which is the same shape
+with the status byte in the command position — 0 is the ACK, anything else is the NAK
+with a numbered reason. NAK = retry the whole frame. Commands: `HELLO`, `GET_META` (the
+winning slip's 32 bytes; FR-2.6 reads version and CRC without booting the app), `ERASE`,
+`WRITE`, `COMMIT`, `RESET`. The receiver is a byte-driven state machine; the host side
+(`host/flasher.py`) mirrors it, and both test suites pin the same canonical frame — one
+protocol, checked rather than asserted.
+
+### 7.5 The update loop (FR-2.5, NFR-2.7)
+
+`firmware/boot/src/boot_update.c` runs in the stay path: frames in, flash out. ERASE
+and WRITE may touch only the two slots (`boot/region.h` — a host frame can never erase
+the program answering it) and WRITE binds to the currently-erased page, because the F1
+programs bits 1→0 only and an un-erased write would corrupt silently. COMMIT re-verifies
+the image's CRC-32 over flash, builds the next slip (`boot_metadata_next`: sequence + 1,
+active = the written slot, written to the loser metadata page), and clears the marker.
+A power cut anywhere before the new slip is whole leaves the previous one intact
+(FR-2.5). The host flasher plans the same discipline page by page; NFR-2.7's budget is
+met with margin (the 42 KB image is ~5.6 s of wire time at 115200 against 30 s).
+
+### 7.6 The application's side
+
+The `update` command (`firmware/app/src/comms.cpp`) writes the marker through the system
+HAL (`hal/system.h`: `update_request`, then `system_reset`) and the node resets; the
+bootloader then opens its update window. The marker (value and backup register) is
+defined once in `boot/update.h`, shared by both images. The app image builds for either
+home (base or slot) including the `firmware.slot.bin` artifact the flasher uploads.
+
+### 7.7 SWD recovery path (NFR-2.8)
+
+The bootloader is the recovery: strap **BOOT0 to 1** and power-cycle to reach the ST
+factory bootloader's UART, or — the normal case — leave BOOT0 at 0 and let the boot
+decision fall to update mode when no image verifies. Via SWD, recovery is unconditional:
+`st-flash --reset write firmware/boot/bootloader.bin 0x08000000` restores the
+bootloader, after which the UART update path works again. The bench board lacks an NRST
+connection to the ST-Link, so `st-flash` resets in software (AIRCR) and
+`--connect-under-reset` is unavailable; the documented procedure therefore never depends
+on it. See `docs/bring-up-log.md` for the session that established this.
 
 ## 8. Phase 3 design — custom MCU and I/O board
 

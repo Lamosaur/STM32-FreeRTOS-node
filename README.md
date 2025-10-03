@@ -4,10 +4,11 @@ Firmware and hardware for a networked sensor/control node: a FreeRTOS task archi
 analog sensing, closed-loop control, field firmware update, and industrial fieldbus I/O —
 all on a **custom board designed, laid out, and brought up for this project**.
 
-**Phases 0 and 1 are implemented and verified on the host.** The five-task architecture,
+**Phases 0, 1 and 2 are implemented and verified on the host.** The five-task architecture,
 the I2C arbiter and its bus-release sequence, the watchdog supervisor, the sensor
 service, the DMA dirty-rectangle display path, the timer-triggered ADC acquisition path,
-the PID control loop with its runtime tuning store, and the host test suite all exist and
+the PID control loop with its runtime tuning store, the 8 KB bootloader, the framed
+update protocol and its host flasher, and the host test suite all exist and
 pass. The target build produces a flashable image for an STM32F103C8T6.
 
 **Nothing has been measured with an instrument.** A Blue Pill is attached and identified
@@ -28,7 +29,7 @@ Requirements, phase plan, and design detail live in **[docs/design-spec.md](docs
 |-------|-------|--------|
 | 0 | FreeRTOS sensor node: shared-bus arbitration, I2C recovery, watchdog, DMA display | **Implemented, host-verified** |
 | 1 | Timer-triggered ADC + DMA, PID control loop, measured scheduling, CI | **Implemented, host-verified**; no on-board figures yet |
-| 2 | Bootloader + field firmware update over a framed UART protocol | Not started |
+| 2 | Bootloader + field firmware update over a framed UART protocol | **Implemented, host-verified**; no on-board run yet |
 | 3 | Modbus RTU over RS-485 + custom 2-layer MCU & I/O board, fabricated and brought up | Not started |
 | 4 | Low-power modes with measured current draw, on the custom board (stretch) | Not started |
 
@@ -113,7 +114,8 @@ conditions under which staying on it would be the better call — is in
 │   │   ├── include/hal/       i2c, gpio, uart, watchdog, system — frozen interfaces
 │   │   └── stm32f1/           the F103 implementation
 │   ├── rtos/                  RTOS interface, FreeRTOS binding, host double
-│   ├── boot/                  Phase 2 bootloader (empty)
+│   ├── boot/                  the Phase 2 bootloader: layout/CRC/metadata/decision/
+│   │                          frame (host-tested boot_core) plus the 8 KB image
 │   └── third_party/           pinned vendored sources, with provenance
 ├── host/                      Python: flasher, telemetry, step-response plots, Modbus client
 ├── hardware/
@@ -158,36 +160,45 @@ The toolchain file searches for `arm-none-eabi-gcc` on `PATH`, under
 `~/.platformio/packages/`, and in `/usr/bin`, so no root install is required. Point
 `-DSTM32_TOOLCHAIN_DIR=/path/to/bin` at any other location.
 
-Output: `build-arm/firmware.elf`, `firmware.hex`, `firmware.bin`, and `firmware.map`.
-The post-build step reports size against the F103C8T6's 64 KB flash and 20 KB RAM.
+Output: `build-arm/firmware.elf`, `firmware.hex`, `firmware.bin`, and `firmware.map`
+(the application at 0x08000000, for direct SWD flashing and bring-up), plus
+`firmware.slot.elf`/`firmware.slot.bin` — the **same application linked at a slot base
+(0x08002000, 56 KB)**, which is the artifact the Phase 2 update path expects and
+`host/flasher.py` uploads. Also `firmware/boot/bootloader.elf`/`bootloader.bin`, the
+8 KB bootloader at 0x08000000. The post-build steps report each image's size.
 
-The linker script is `firmware/stm32f103c8t6.ld`, sized for the part number's rated 64 KB.
-The board on the bench reports **128 KB** and has been shown to hold data above the 64 KB
-mark, but the rated figure is what the script uses until the Phase 3 MCU choice settles
-which part is actually being targeted; see [docs/bring-up-log.md](docs/bring-up-log.md).
+The linker script is `firmware/stm32f103c8t6.ld`, sized for the part number's rated 64 KB,
+with its slot twin `stm32f103c8t6_slot.ld`; a host test keeps both (and the bootloader's
+script) in agreement with the layout authority `firmware/boot/include/boot/layout.h`
+(NFR-2.9). The board on the bench reports **128 KB** and has been shown to hold data
+above the 64 KB mark; the slot build uses the real budget while the direct-flash build
+stays datasheet-bounded. See [docs/bring-up-log.md](docs/bring-up-log.md).
 
-### Flash
+### Flash and update
 
-Programming is over SWD. With a bare ST-Link and no OpenOCD:
+Two ways onto a board, matching the two images:
 
-```sh
-st-flash --reset write build-arm/firmware.bin 0x08000000
-```
-
-Or with OpenOCD:
-
-```sh
-openocd -f interface/stlink.cfg -f target/stm32f1x.cfg \
-        -c "program build-arm/firmware.elf verify reset exit"
-```
+- **Direct (bring-up, no bootloader):** SWD with a bare ST-Link:
+  ```sh
+  st-flash --reset write build-arm/firmware.bin 0x08000000
+  ```
+- **Field update (Phase 2):** the bootloader at 0x08000000 plus the host flasher.
+  First install the bootloader over SWD once:
+  ```sh
+  st-flash --reset write build-arm/firmware/boot/bootloader.bin 0x08000000
+  ```
+  Then, from the running application, the `update` command on the host link resets into
+  the bootloader's update mode, and the flasher completes the job:
+  ```sh
+  ./host/flasher.py --port /dev/ttyUSB0 --image build-arm/firmware.slot.bin
+  ./host/flasher.py --port /dev/ttyUSB0 --info   # HELLO + metadata
+  ```
 
 If the ST-Link's NRST line is not wired to the target — which is the case on the bench
 board, and what `st-flash` reports as *"NRST is not connected"* — every reset becomes a
 software reset through `AIRCR`. That works for flashing, but it means `--connect-under-reset`
-is unavailable and the reset button is the only way to force a hardware reset.
-
-The target config changes with the board revision; see `docs/bring-up-log.md` step 4 for
-the SWD bring-up step.
+is unavailable and the reset button is the only way to force a hardware reset. The
+SWD recovery path is documented in design-spec.md §7.7 (NFR-2.8).
 
 ### Host link
 
@@ -199,6 +210,7 @@ The comms task runs a small text command set at 115200 8N1 on USART1 (PA9/PA10):
 | `stat` | Every counter: bus transfers, failures, recoveries, contentions, timeouts, display bytes, sensor results, watchdog feeds, worst lateness |
 | `recover` | Force the FR-0.3 nine-clock bus release now, rather than waiting to catch one |
 | `timing` | The NFR-1.8/1.9 report (period jitter, ISR latency): sends a published window, or asks for a snapshot of the running one |
+| `update` | Phase 2 handshake: set the update marker in the backup domain and reset into the bootloader, whose 30 s update window then awaits `host/flasher.py` |
 | `help` | List the commands |
 
 Telemetry lines are emitted once a second:
@@ -230,6 +242,11 @@ Stated plainly, because the difference matters when someone reads a claim later.
   fail loudly.
 - The control loop holds its period, clamps its integral, refuses to act on a stale
   reading, and never delivers a partially-updated set of gains under concurrent writes.
+- Phase 2: the layout authority, the metadata slips, the CRC-32 image verification, the
+  fallback ladder, the framed protocol, the update loop, and the host flasher all exist
+  and are exercised by the host suite — including the same canonical frame on both ends
+  of the wire. Both app images (base and slot) and the bootloader build clean with
+  `-Werror` on two toolchains.
 
 **Not established, because the board does not boot the flashed image yet:**
 
