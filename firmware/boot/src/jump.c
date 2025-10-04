@@ -37,7 +37,7 @@ void boot_jump(uint32_t slot) {
   __set_MSP(app_sp);
 
   typedef void (*reset_fn)(void);
-  reset_fn reset = (reset_fn)(app_pc & ~1u);
+  reset_fn reset = (reset_fn)(app_pc | 1u);
   reset();
   for (;;) { /* the application's reset handler never returns */
   }
