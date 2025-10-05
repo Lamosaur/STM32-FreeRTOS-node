@@ -65,7 +65,7 @@ static void nak(uint8_t status) {
 bool boot_update_marker_read(void) {
   RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
   (void)RCC->APB1ENR; /* let the bus come up */
-  return BKP->DR3 == BOOT_UPDATE_MARKER;
+  return (BKP->DR3 & 0xFFFFu) == BOOT_UPDATE_MARKER;
 }
 
 void boot_update_marker_clear(void) {

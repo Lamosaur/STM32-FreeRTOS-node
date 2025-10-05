@@ -20,8 +20,20 @@
 extern "C" {
 #endif
 
-/* ASCII "UPD1" read little-endian: distinctive, and it displays readably in a debugger. */
-#define BOOT_UPDATE_MARKER 0x31504455u
+/* ASCII "UP". 16-bit on purpose: the F1's BKP_DRx registers are 16-bit hardware
+ * (the vendored CMSIS types them uint32_t, so the compiler cannot see the
+ * truncation), and a marker wider than 16 bits can never compare equal after a
+ * round trip through DR3 — which silently disables the whole update-requested rung.
+ * Distinct from erased (0xFFFF), cleared (0x0000) and any residue of the old
+ * 32-bit marker's low half, so a stale register cannot false-trigger. */
+#define BOOT_UPDATE_MARKER 0x5055u
+
+/* The marker must survive a round trip through a 16-bit BKP_DRx register. A wider
+ * value truncates on write and can never compare equal on read, which silently
+ * disables the update-requested rung — the compiler cannot see it (CMSIS types
+ * the registers uint32_t), so the constraint is enforced here, where both images
+ * and the host tests compile it. */
+_Static_assert(BOOT_UPDATE_MARKER <= 0xFFFFu, "marker must fit a 16-bit BKP register");
 
 /* BKP_DR3. BKP_DR1 and DR2 carry the application's boot counter and its validity marker;
  * DR3 is free, and both images know the number because both include this header. */
