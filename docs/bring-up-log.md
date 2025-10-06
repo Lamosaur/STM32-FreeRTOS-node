@@ -292,3 +292,139 @@ jumper could not be inconsistent the way this board is (1 flash-boot out of 4 re
    timing constants simply do not apply until it does.
 3. Then the first on-board tests: FR-0.3 (hold SDA low, `recover`, count 9 SCL pulses +
    1 STOP) and the Phase 1 ADC path with the capacitive probe connected.
+
+---
+
+## Phase 2 — bootloader on silicon (SWD + GDB, no UART bridge)
+
+Tools: `st-flash`/`st-info`/`st-util` 1.8.0, system `gdb` (x86: ARM regs unreadable,
+memory reads fine), `arm-none-eabi-objdump`/`size` 13.2.1. `st-util -n -m -p 4242`
+holds the probe while running — `st-flash` then reports "unable to claim"; stop it
+(`pkill -x st-util`; `-f` matches your own shell) before any flash op. A hung
+ST-Link (visible in `lsusb`, invisible to stlink) recovers with a USB
+`USBDEVFS_RESET`, no replug needed.
+
+### 2026-10-14 — BOOT0 to 0, HEAD app boots, boot counter live
+
+**Goal:** clear the Sep-20 boot trap and prove the app runs.
+**Setup:** BOOT0 (JP1) to 0. `build-arm/firmware/firmware.bin` (43912 B, has `update`).
+**Observations:** `st-info --probe` back to 1 programmer after USB reset. `st-flash
+--reset write .../firmware.bin 0x08000000` verified; vectors read back
+`SP=0x20005000 PC=0x08006549`. `BKP_DR1` (boot count) `7 -> 9` across a reset;
+`BKP_DR2` keeps `0xB007` from the Sep-20 probe session — backup domain never lost
+power. `st-flash reset` sometimes delivers two system resets (`+2` on one command,
+also seen with no bootloader involved); DR1 is monotonic proof of boot, not an exact
+reset count.
+**Result:** boot blocker cleared. Image stale (Sep build vs HEAD) — reflashed below.
+
+### 2026-10-14 — Phase 2 geometry installed; ladder happy path
+
+**Goal:** bootloader + slot + slip via SWD only.
+**Setup:** `bootloader.bin` (4392 B) at `0x08000000`, `firmware.slot.bin` (43912 B,
+`SP=0x20005000 PC=0x08008549`, `%4==0`, `< 56 KB`) at `0x08002000`. Slip A crafted
+off-target (magic `B007B007`, seq 1, slot A, size, CRC-32 `ccb243af`, v1, CRC-16
+over 28 B) and written to `0x0801E000`, read back identical. Metadata pages were
+`0xFF` (fresh).
+**Observations:** after reset `DR1 9 -> 10`, `SCB->VTOR == 0x08002000` — newest valid
+slip verified over live flash and jumped (FR-2.2/FR-2.3 happy path).
+**Open:** banner/HSE verdict still needs a UART sniffer (logic analyzer on PA9).
+
+### 2026-10-14 — `st-flash erase` with address mass-erases (tool hazard)
+
+**Observation:** `st-flash erase 0x08002000 0x400` printed "Mass erase completed
+successfully" — 1.8.0 ignores the range and wipes the chip (bootloader included).
+**Change:** never use `erase` with an address; single pages are cleared with a
+range-limited `write` of `0xFF` (erase + program-nothing), corruption with a `write`
+of garbage. Full restore via SWD afterward re-verified the happy path (`DR1 10 ->
+11`, `VTOR=0x08002000`) — this doubles as the NFR-2.8 recovery drill.
+**Follow-up:** record in the NFR-2.8 procedure: recovery is `write`, never `erase`.
+
+### 2026-10-14 — corrupt-image stay + newest-wins + rollback selection
+
+**Setup:** 1 KB `0xAA` written to slot A page 0 (vectors destroyed, slip A intact).
+**Observations:** after reset `DR1` static at 11, `VTOR == 0x00000000` (reset default)
+— failed image leaves the node in the bootloader (FR-2.2 letter). Slot A restored;
+slot B programmed with the slot-A-linked image and slip B (seq 2) written: newest
+wins, `VTOR == 0x08010000` (sequence arbitration on silicon). Slot B corrupted:
+`VTOR == 0x08002000` — rollback selects A. (Caveat: only a slot-A-linked image
+exists in-tree, so slot B can prove selection, never execution.)
+**Result:** decision half of FR-2.3 correct; the branch itself was not — next entry.
+
+### 2026-10-14 — BUG: `boot_jump` clears the Thumb bit (FR-2.3 broken as-written)
+
+**Observation:** after the rollback-to-A reset the core sat in HardFault:
+`CFSR = 0x00020000` (INVSTATE), `HFSR = 0x40000000` (FORCED), stacked PC even
+(`0x08008548`), stacked LR `0x08000573`.
+**Hypothesis:** branch to an even address. `firmware/boot/src/jump.c:40`:
+`reset = (reset_fn)(app_pc & ~1u)` — clears the mode bit its own comment says to
+set. `objdump` of the shipped `bootloader.elf` confirms: `bic.w r3, r2, #1` +
+`blx r3`, and `0x08000573` is exactly that `blx` site + 3. Every jump faults;
+no application has ever run through this bootloader.
+**Change:** one char: `& ~1u` -> `| 1u`. Rebuilt (`build-arm-fix`, system GCC
+13.2.1, clean under `-Werror`): `orr.w r3, r2, #1` + `blx r3`, 4356 B.
+**Result:** reflashed; `DR1 13 -> 14`, `VTOR=0x08002000`, `CFSR/HFSR` stay 0 —
+clean jump, app boots. Host suite cannot catch this (`jump.c` is target-only):
+312/312 pass before and after.
+**Open:** earlier `DR1` increments under the broken bootloader are unexplained by
+any single consistent model (resets sometimes double — proven with no bootloader
+involved — plus batched-op misattribution are candidates); not chased further.
+
+### 2026-10-14 — BUG: 32-bit update marker vs 16-bit BKP_DRx (update rung dead)
+
+**Observation:** `BKP_DR3` written with `0x31504455` (`firmware/boot/include/boot/
+update.h:24`) reads back `0x00004455`: F1 backup registers are 16-bit hardware
+(CMSIS types them `uint32_t`, so `-Wconversion` stays silent). `BKP->DR3 ==
+0x31504455` is false on every boot — the `update` command's marker is ignored and
+the update-requested rung unreachable.
+**Change:** marker `0x5055` ("UP", != `0xFFFF`/`0x0000`/old residue `0x4455`), read
+as `(BKP->DR3 & 0xFFFFu) == BOOT_UPDATE_MARKER`, plus `_Static_assert(marker <=
+0xFFFF)` (negative-tested: widening fails the build on host and target).
+Rebuilt app + slot (44596 B, still `< 56 KB`; wire `~6 s` vs the 30 s NFR-2.7
+budget) and reflashed bootloader + slot A + new slip (CRC-32 `4c4934b4):
+mid-sequence reset with a stale slip correctly stayed (CRC mismatch), then
+`DR1 -> 16`, `VTOR=0x08002000`, no faults.
+**Result:** marker round-trips (`DR3 == 0x5055` read back); rung testable — next.
+
+### 2026-10-14 — update-requested entry + 30 s anti-brick expiry
+
+**Setup:** marker `0x5055` set via GDB (needs PWR `DBP`; a plain write to a
+write-protected DR3 is silently dropped — first attempt stored nothing).
+**Observations:** after reset `DR1` static, `DR3 == 0x5055`, `VTOR == 0` — update
+mode entered, no jump (rung 1). NOTE: every GDB attach halts the core and `quit`
+leaves it halted — a 130 s "wait" with periodic reads measured nothing for exactly
+this reason; the valid run is one reset, zero debugger contact, then one read.
+After 60 s untouched: `DR1 17 -> 19`, `DR3 == 0x0000`, `VTOR=0x08002000`,
+`CFSR == 0` — window expired, marker cleared, app booted (anti-brick works).
+`USART1->SR` polled `RXNE == 0` throughout, so no noise involvement.
+**Open:** exact window length unmeasured (needs LA timestamps on PA9:
+banner -> `running slot A` delay); `GET_META`/framed update/timed NFR-2.7 run still
+need UART TX.
+
+### 2026-10-14 — first light on the wire: banners, HSE verdict, live telemetry (LA)
+
+**Goal:** catch a real boot on the logic analyzer (Saleae-clone via `sigrok-cli`
+0.7.2/`fx2lafw`, 8 MHz; `CH7=PA9`, `CH5=PB6`, `CH3=PB7`, `CH6=PB1`, `CH4=PB0`,
+`CH2=PB5`, GND common).
+**Setup:** two NRST-button presses caught in back-to-back captures; UART decoded at
+115200 (bootloader's 115942 is inside tolerance — verified readable).
+**Observations:**
+- `boot 0.1.0`, `boot reason: newest slot verified`, `boot: running slot A` —
+  the ladder on the wire (FR-2.1).
+- App: `boot greenhouse-node-01 fw 0.1.0 built Oct 14 2026 20:27:08` (the fixed
+  build, identified), **`clock 72 MHz HSE+PLL`** — first HSE verdict: the crystal
+  starts. `reset external-pin boots=7` then `8` (+1 per button press, no doubling),
+  `heap 9704 bytes free`, `[init] 5 tasks running` (FR-0.1).
+- `i2c scan: no devices answered` — bus is bare; no AHT20/OLED attached.
+- Steady state: `T=--.-- RH=--.-- seq=0 moist=724 bus=0/N rec=0 feeds=+4/s` —
+  ADC path producing values on silicon (FR-1.1 alive), NACKs counted but never
+  treated as bus faults (`rec=0`, FR-0.3), watchdog fed, stale readings shown as
+  dashes rather than frozen values. I2C decode shows the `0x38` poll + NACK
+  repeating; all trace pins toggle (scheduler/ISR/control alive).
+- Telemetry at 1 Hz and feeds at 4 Hz match configured rates, which assume a
+  72 MHz SysTick — independent corroboration of HSE before the banner was read.
+- Count-chain note: banner `boots=7/8` vs the earlier GDB `DR1=19` — a USB reset of
+  the ST-Link power-cycled the target (3V3 comes from the probe) and the backup
+  domain restarted at 1, exactly the documented power-loss property the NFR-0.7
+  instrument relies on.
+**Open:** `FR-0.3` nine-pulse waveform (needs SDA held + `recover` = UART TX);
+everything else electrical still needs instruments.
