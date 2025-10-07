@@ -161,9 +161,29 @@ can be logged from inside the run.
 
 | # | Figure | Value | Instrument / method | Requirement |
 |---|--------|-------|---------------------|-------------|
-| 2-1 | Full update time | ___ s | Timed host update at 115200 baud, must be under 30 s | NFR-2.7 |
-| 2-2 | Image size | ___ B | `arm-none-eabi-size` on the shipped image | NFR-2.7 |
-| 2-3 | Boots to a valid image after a power cut mid-update | ___ of ___ | Repeated power-cut test | FR-2.5 |
+| 2-1 | Full update time | ___ s (blocked: needs UART TX). Budget: 44596 B image is ~6 s of wire time at 115200 against 30 s (`transfer_budget_bytes` in `host/flasher.py`) | Timed host update at 115200 baud, must be under 30 s | NFR-2.7 |
+| 2-2 | Image size | **bootloader 4356 B** (of 8 KB), **app 44596 B** (of 56 KB slot) | `arm-none-eabi-size` + `.bin` on the shipped images (`build-arm-fix/`) | NFR-2.7 |
+| 2-3 | Boots to a valid image after a power cut mid-update | mechanism rows proven on silicon (see below); torn-write + true power-cut open | Repeated power-cut test | FR-2.5 |
+
+SWD-proven on silicon 2026-10-14 (see `bring-up-log.md`, Phase 2 section; GDB memory
+reads + `BKP_DR1` boot counter + `SCB->VTOR` + `CFSR/HFSR` — no UART bridge):
+
+- newest valid slip boots its slot (`DR1`++, `VTOR=slot`, faults 0) — FR-2.2/FR-2.3
+  happy path, after the `jump.c` Thumb-bit fix below;
+- stale slip vs new image (CRC mismatch) stays; garbage first page stays
+  (`DR1` static, `VTOR=0`) — FR-2.2 letter;
+- seq-2 slip beats seq-1 (multi-slot arbitration), corrupt newest falls back to the
+  loser slip's slot (rollback selection) — FR-2.2 ladder;
+- `BKP_DR3` marker enters update mode (no immediate jump), 30 s window expiry clears
+  the marker and boots the app (anti-brick) — update rung;
+- full chip erase recovered purely over SWD (NFR-2.8 drill).
+
+Two firmware bugs found and fixed in the process (both invisible to the 312-test host
+suite): `boot_jump` cleared the Thumb bit (`& ~1u`, must be `| 1u` — every jump
+HardFaulted with INVSTATE, proven by stacked PC + `objdump` `bic`); the 32-bit update
+marker could never survive the 16-bit `BKP_DRx` (`0x31504455` -> `0x5055` + masked
+read + `_Static_assert`). UART-TX-blocked: framed update end-to-end, `GET_META`,
+timed update run, exact window length (needs LA timestamps on PA9).
 
 ---
 
