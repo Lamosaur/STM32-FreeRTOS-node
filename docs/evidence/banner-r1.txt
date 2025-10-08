@@ -1,0 +1,22 @@
+boot 0.1.0
+boot reason: newest slot verified
+boot: running slot A
+boot greenhouse-node-01 fw 0.1.0 built Oct 14 2026 20:27:08
+clock 72 MHz HSE+PLL
+reset external-pin boots=7
+heap 9704 bytes free
+i2c scan: no devices answered (check pull-ups, wiring and power)
+boot greenhouse-node-01
+ver 0.1.0 built  
+reset external-pin boots=7
+[init] 5 tasks running
+T=--.-- RH=--.-- seq=0 moist=-- bus=0/3 rec=0 feeds=1
+T=--.-- RH=--.-- seq=0 moist=724 bus=0/4 rec=0 feeds=5
+T=--.-- RH=--.-- seq=0 moist=723 bus=0/5 rec=0 feeds=9
+T=--.-- RH=--.-- seq=0 moist=722 bus=0/6 rec=0 feeds=13
+T=--.-- RH=--.-- seq=0 moist=723 bus=0/7 rec=0 feeds=17
+T=--.-- RH=--.-- seq=0 moist=724 bus=0/8 rec=0 feeds=21
+T=--.-- RH=--.-- seq=0 moist=722 bus=0/9 rec=0 feeds=25
+T=--.-- RH=--.-- seq=0 moist=724 bus=0/10 rec=0 feeds=29
+T=--.-- RH=--.-- seq=0 moist=723 bus=0/11 rec=0 feeds=33
+T=--.-- RH=--.-- seq=0 moist=723 bus=0/12 rec=0 feeds=37
