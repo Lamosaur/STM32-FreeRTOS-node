@@ -1,5 +1,17 @@
 # STM32 FreeRTOS Sensor & Control Node
 
+An STM32 greenhouse node that boots through its own bootloader, verifies its
+firmware against flash before jumping, and narrates every step on the wire —
+captured below with a logic analyzer, not claimed in prose. Two bootloader bugs
+surfaced exactly this way (a cleared Thumb bit that HardFaulted every jump; a
+32-bit marker in a 16-bit backup register that silently disabled updates) and are
+fixed, measured, and logged in [docs/bring-up-log.md](docs/bring-up-log.md).
+
+![Boot banner decoded from PA9: bootloader reason, slot selection, app clock and reset cause](docs/evidence/uart-banner.png)
+
+Full capture set with render script: [docs/evidence/](docs/evidence/) (raw `.sr`
+for PulseView, transcripts, I2C sweep, telemetry cadence).
+
 Firmware and hardware for a networked sensor/control node: a FreeRTOS task architecture,
 analog sensing, closed-loop control, field firmware update, and industrial fieldbus I/O —
 all on a **custom board designed, laid out, and brought up for this project**.
