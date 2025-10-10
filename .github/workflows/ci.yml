@@ -191,7 +191,15 @@ jobs:
         # target's libstdc++ lives.
         run: |
           cxxinc=$(ls -d /usr/lib/arm-none-eabi/include/c++/*/ | head -1)
-          bitsdir=$(dirname "$(find "$cxxinc" -path '*thumb/v7-m/nofp*' -name c++config.h | head -1)")
+          # c++config.h lives in <multilib>/bits/, but cstddef asks for
+          # <bits/c++config.h>, so the -isystem path must be the multilib dir
+          # itself (two dirnames up from the file), not the bits/ dir.
+          cfg=$(find "$cxxinc" -path '*thumb/v7-m/nofp*' -name c++config.h | head -1)
+          bitsdir=$(dirname "$(dirname "$cfg")")
+          if [ -z "$cfg" ] || [ ! -f "$bitsdir/bits/c++config.h" ]; then
+            echo "::error::multilib c++config.h not found under $cxxinc"
+            exit 1
+          fi
           clang-tidy -p build-arm \
             --extra-arg=-isystem"$cxxinc" \
             --extra-arg=-isystem"$bitsdir" \
