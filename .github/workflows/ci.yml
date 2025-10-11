@@ -51,7 +51,7 @@ jobs:
     name: Host unit tests (FR-0.6)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build tools
         run: |
@@ -74,7 +74,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: host-test-log
           path: build/Testing/Temporary/LastTest.log
@@ -84,7 +84,7 @@ jobs:
     name: Firmware cross-build (arm-none-eabi)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install toolchain
         # libstdc++-arm-none-eabi-newlib is a separate package from the compiler on
@@ -140,7 +140,7 @@ jobs:
           PY
 
       - name: Upload firmware artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: firmware
           path: |
@@ -153,7 +153,7 @@ jobs:
     name: Static analysis (FR-1.6)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install tools
         run: |
