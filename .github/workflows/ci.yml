@@ -213,7 +213,14 @@ jobs:
         # peripheral register dereferences a fixed address, which is what the check is
         # looking for, so on this code it reports the design rather than a defect.
         run: |
+          # clang-tidy uses the host clang's include paths, not the ARM
+          # toolchain's, so the newlib + gcc freestanding headers must be added
+          # explicitly (same reason as the step above). Without this the C files
+          # fail with "'string.h' file not found".
+          gccinc=$(dirname "$(arm-none-eabi-gcc -print-file-name=include/stddef.h)")
           clang-tidy -p build-arm \
+            --extra-arg=-isystem/usr/lib/arm-none-eabi/include \
+            --extra-arg=-isystem"$gccinc" \
             -checks="$CLANG_TIDY_CHECKS,-clang-analyzer-core.FixedAddressDereference" \
             -warnings-as-errors='*' \
             firmware/hal/stm32f1/*.c firmware/rtos/freertos/*.c
