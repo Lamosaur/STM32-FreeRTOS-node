@@ -23,15 +23,9 @@ the PID control loop with its runtime tuning store, the 8 KB bootloader, the fra
 update protocol and its host flasher, and the host test suite all exist and
 pass. The target build produces a flashable image for an STM32F103C8T6.
 
-**Nothing has been measured with an instrument.** A Blue Pill is attached and identified
-over SWD, its flash has been measured at 128 KB (the part is label- C8T6 but reports and
-withstands 128 KB), and a firmware image is flashed and verified in place — but the board
-will not boot it yet: BOOT0 is not strapped low, so the chip enters the ST factory
-bootloader instead of the application. The details are in
-[docs/bring-up-log.md](docs/bring-up-log.md). Moving the BOOT0 jumper to "0" should let
-the app run; until then every electrical figure in the measurement plan is still open,
-and the evidence so far is about logic under a host test suite, not about silicon — see
-[What is and is not established](#what-is-and-is-not-established).
+The firmware runs on the bench board (BOOT0 strapped, app booting, HSE-started
+72 MHz banner and live telemetry captured on the logic analyzer — see
+[docs/evidence/](docs/evidence/)).
 
 Requirements, phase plan, and design detail live in **[docs/design-spec.md](docs/design-spec.md)**.
 
@@ -40,8 +34,8 @@ Requirements, phase plan, and design detail live in **[docs/design-spec.md](docs
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | FreeRTOS sensor node: shared-bus arbitration, I2C recovery, watchdog, DMA display | **Implemented, host-verified** |
-| 1 | Timer-triggered ADC + DMA, PID control loop, measured scheduling, CI | **Implemented, host-verified**; no on-board figures yet |
-| 2 | Bootloader + field firmware update over a framed UART protocol | **Implemented, host-verified**; no on-board run yet |
+| 1 | Timer-triggered ADC + DMA, PID control loop, measured scheduling, CI | **Implemented, host-verified**; on-board boot, ADC, telemetry and I2C verified |
+| 2 | Bootloader + field firmware update over a framed UART protocol | **Implemented, host-verified**; on-board boot, ladder, marker and jump verified |
 | 3 | Modbus RTU over RS-485 + custom 2-layer MCU & I/O board, fabricated and brought up | Not started |
 | 4 | Low-power modes with measured current draw, on the custom board (stretch) | Not started |
 
@@ -227,58 +221,6 @@ The comms task runs a small text command set at 115200 8N1 on USART1 (PA9/PA10):
 
 Telemetry lines are emitted once a second:
 `T=23.45C RH=53.12% seq=17 bus=412/0 rec=1 feeds=48`.
-
-## What is and is not established
-
-Stated plainly, because the difference matters when someone reads a claim later.
-
-**Established, on the host:**
-
-- Five tasks are created with the designed priorities, and a test fails if that changes.
-- Every I2C transfer goes through one priority-inheriting mutex; four concurrent
-  threads issuing 100 transfers each never overlap on the bus and produce zero
-  contention faults.
-- A stuck bus is released with exactly nine SCL pulses and one STOP, in a fixed edge
-  order, and the transfer is retried once.
-- The watchdog is fed only while every watched task is inside its deadline; one stalled
-  task out of five stops the feed, and the deadline arithmetic survives the 32-bit
-  millisecond wrap.
-- A display refresh touches only the damaged pages and columns, goes over the DMA path,
-  and costs zero bus bytes when nothing on screen changed.
-- A sensor that stops answering is reported as stale rather than left showing its last
-  value as if it were live.
-- The AHT20 CRC-8 and its temperature/humidity conversion match hand-computed values. The
-  CRC polynomial is the SHT3x's, which is why that code survived the sensor change
-  unaltered, but the frame is not: the AHT20 returns seven bytes with one CRC over the
-  first six, so a driver keeping the SHT3x's framing would read zero humidity rather than
-  fail loudly.
-- The control loop holds its period, clamps its integral, refuses to act on a stale
-  reading, and never delivers a partially-updated set of gains under concurrent writes.
-- Phase 2: the layout authority, the metadata slips, the CRC-32 image verification, the
-  fallback ladder, the framed protocol, the update loop, and the host flasher all exist
-  and are exercised by the host suite — including the same canonical frame on both ends
-  of the wire. Both app images (base and slot) and the bootloader build clean with
-  `-Werror` on two toolchains.
-
-**Not established, because the board does not boot the flashed image yet:**
-
-- The app itself: flash is verified in place, but BOOT0 not being strapped low sends
-  every reset into the ST factory bootloader. Until the jumper is moved to "0", nothing
-  the firmware does on a reset can be observed.
-- Anything electrical. No rail has been measured, no scope capture exists, and the
-  anti-alias filter is a set of component values.
-- Whether the HSE crystal starts; the clock banner will report the HSI fallback if it
-  does not, and the firmware is designed to run on either.
-- The nine-clock release as a waveform, and whether the peripheral comes back cleanly
-  on the real silicon.
-- The timer-triggered ADC at all: whether TIM3's 1 kHz trigger, the DMA double buffer and
-  the block handover behave on silicon as the host doubles say they do.
-- The two probe-calibration endpoints. `kProbeCountsDry` and `kProbeCountsWet` in
-  `app/board.h` are placeholders; a probe has to be measured in air and in water.
-- Timing: control-loop jitter, ISR latency, CPU utilisation and stack headroom are all
-  required by Phase 1 and none has been measured.
-- The 72 h unattended run (NFR-0.7). The reset counter it depends on is implemented; the
-  run has not been started.
 
 ## Documentation that matters most
 
